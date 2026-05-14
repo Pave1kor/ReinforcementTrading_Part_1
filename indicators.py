@@ -36,7 +36,7 @@ def load_and_preprocess_data(csv_path: str):
     df["norm_pressure"] = np.where(df["bar_range"] != 0, df["pressure"] / df["bar_range"], 0.0)
 
     # ----- Delta -----
-    df["delta"] = df["norm_pressure"] * df["volume"]
+    df["delta"] = df["norm_pressure"] * df["Volume"]
 
     # ----- Средние -----
     df["cvd_avg"] = ta.alma(df["delta"], 100, 0.85, 6)
@@ -48,7 +48,7 @@ def load_and_preprocess_data(csv_path: str):
 
     # ----- Нормализация -----
     df["atr"] = ta.atr(300)
-    df["avg_vol"] = ta.sma(df["volume"], 300)
+    df["avg_vol"] = ta.sma(df["Volume"], 300)
 
     df["price_slope"] = np.where(df["atr"] != 0, df["price_slope_raw"] / df["atr"], df["price_slope_raw"])
     df["cvd_slope"] = np.where(df["avg_vol"] != 0, df["cvd_slope_raw"] / df["avg_vol"], df["cvd_slope_raw"])
@@ -74,14 +74,14 @@ def load_and_preprocess_data(csv_path: str):
     df["p20"] = ta.percentile_nearest_rank(df["slope_div"], 300, 20)
 
     conditions = [
-    df["divStrength"] > df["p90"],
-    df["divStrength"] > df["p80"],
-    df["divStrength"] > df["p70"],
-    df["divStrength"] > df["p60"],
-    df["divStrength"] > df["p50"],
-    df["divStrength"] > df["p40"],
-    df["divStrength"] > df["p30"],
-    df["divStrength"] > df["p20"],
+    df["slope_div"] > df["p90"],
+    df["slope_div"] > df["p80"],
+    df["slope_div"] > df["p70"],
+    df["slope_div"] > df["p60"],
+    df["slope_div"] > df["p50"],
+    df["slope_div"] > df["p40"],
+    df["slope_div"] > df["p30"],
+    df["slope_div"] > df["p20"],
     ]
     choices = [9, 8, 7, 6, 5, 4, 3, 2]
 
