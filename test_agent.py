@@ -2,6 +2,7 @@ import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 
+
 from stable_baselines3 import PPO
 from stable_baselines3.common.vec_env import DummyVecEnv
 
@@ -39,7 +40,7 @@ def run_one_episode(model, vec_env, deterministic=True):
 
 def main():
     # Choose the dataset you want to evaluate on
-    file_path = "data/EURUSD_15 Mins_Ask_2020.12.06_2025.12.12.csv"
+    file_path = "data/test_EURUSD_Candlestick_1_Hour_BID_20.02.2023-22.02.2025"
     df, feature_cols = load_and_preprocess_data(file_path)
 
     # If you want a true OOS test here, split and use only the test slice:

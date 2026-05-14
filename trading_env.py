@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import numpy as np
 
+
 # Prefer gymnasium if available (SB3 supports it), fallback to gym
 try:
     import gymnasium as gym

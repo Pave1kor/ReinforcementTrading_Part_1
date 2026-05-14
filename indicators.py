@@ -1,6 +1,6 @@
 import pandas as pd
 import numpy as np
-import ta
+import pandas_ta as ta
 
 
 def load_and_preprocess_data(csv_path: str):
@@ -39,6 +39,7 @@ def load_and_preprocess_data(csv_path: str):
     df["delta"] = df["norm_pressure"] * df["Volume"]
 
     # ----- Средние -----
+
     df["cvd_avg"] = ta.alma(df["delta"], 100, 0.85, 6)
     df["price_avg"] = ta.alma(df["Close"], 65, 0.85, 6)
 
@@ -47,8 +48,8 @@ def load_and_preprocess_data(csv_path: str):
     df["price_slope_raw"] = ta.linreg(df["price_avg"], 8, 0) - ta.linreg(df["price_avg"], 8, 1)
 
     # ----- Нормализация -----
-    df["atr"] = ta.atr(300)
-    df["avg_vol"] = ta.sma(df["Volume"], 300)
+    df["atr"] = ta.atr(df["High"], df["Low"], df["Close"], length=300)
+    df["avg_vol"] = ta.sma(df["Volume"], length=300)
 
     df["price_slope"] = np.where(df["atr"] != 0, df["price_slope_raw"] / df["atr"], df["price_slope_raw"])
     df["cvd_slope"] = np.where(df["avg_vol"] != 0, df["cvd_slope_raw"] / df["avg_vol"], df["cvd_slope_raw"])
@@ -64,27 +65,31 @@ def load_and_preprocess_data(csv_path: str):
     df["bear_div"] = (df["price_slope"] > 0) & (df["cvd_slope"] < 0)
     
     # ----- Уровни силы -----
-    df["p90"] = ta.percentile_nearest_rank(df["slope_div"], 300, 90)
-    df["p80"] = ta.percentile_nearest_rank(df["slope_div"], 300, 80)
-    df["p70"] = ta.percentile_nearest_rank(df["slope_div"], 300, 70)
-    df["p60"] = ta.percentile_nearest_rank(df["slope_div"], 300, 60)
-    df["p50"] = ta.percentile_nearest_rank(df["slope_div"], 300, 50)
-    df["p40"] = ta.percentile_nearest_rank(df["slope_div"], 300, 40)
-    df["p30"] = ta.percentile_nearest_rank(df["slope_div"], 300, 30)
-    df["p20"] = ta.percentile_nearest_rank(df["slope_div"], 300, 20)
+    # Вычисляем скользящие перцентили через встроенный метод pandas
+    for p in range(20, 100, 10):
+        df[f"p{p}"] = (
+            df["slope_div"]
+            .rolling(window=300)
+            .quantile(p / 100, interpolation="nearest")
+        )
 
+    # Удаляем NaNs СРАЗУ после оконных функций, чтобы np.select отработал корректно
+    df.dropna(inplace=True)
+
+    # Формируем списки условий и значений для np.select
     conditions = [
-    df["slope_div"] > df["p90"],
-    df["slope_div"] > df["p80"],
-    df["slope_div"] > df["p70"],
-    df["slope_div"] > df["p60"],
-    df["slope_div"] > df["p50"],
-    df["slope_div"] > df["p40"],
-    df["slope_div"] > df["p30"],
-    df["slope_div"] > df["p20"],
+        df["slope_div"] > df["p90"],
+        df["slope_div"] > df["p80"],
+        df["slope_div"] > df["p70"],
+        df["slope_div"] > df["p60"],
+        df["slope_div"] > df["p50"],
+        df["slope_div"] > df["p40"],
+        df["slope_div"] > df["p30"],
+        df["slope_div"] > df["p20"],
     ]
     choices = [0.9, 0.8, 0.7, 0.6, 0.5, 0.4, 0.3, 0.2]
 
+    # Присваиваем уровни силы (если ни одно условие не выполнено, ставится 1)
     df["strengthLevel"] = np.select(conditions, choices, default=1)
 
     # Drop initial NaNs from indicators

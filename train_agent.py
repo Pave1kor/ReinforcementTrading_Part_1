@@ -2,6 +2,7 @@ import os
 import numpy as np
 import matplotlib.pyplot as plt
 
+
 from stable_baselines3 import PPO
 from stable_baselines3.common.vec_env import DummyVecEnv
 from stable_baselines3.common.callbacks import CheckpointCallback
@@ -40,7 +41,7 @@ def evaluate_model(model: PPO, eval_env: DummyVecEnv, deterministic: bool = True
 
 def main():
     #file_path = "data/EURUSD_15 Mins_Ask_2020.12.06_2025.12.12.csv"
-    file_path = "data/EURUSD_Hourly_Ask_2015.12.01_2025.12.16.csv"
+    file_path = "data/EURUSD_Candlestick_1_Hour_BID_01.07.2020-15.07.2023.csv"
     df, feature_cols = load_and_preprocess_data(file_path)
 
     # Time split 80/20
@@ -68,16 +69,16 @@ def main():
             max_slippage_pips=0.2,
             random_start=True,
             min_episode_steps=1000,
-            episode_max_steps=2000,
+            episode_max_steps=2048,
             feature_columns=feature_cols,
-            hold_reward_weight=0.005, #0.05
-            open_penalty_pips=1.2,      # Стоимость открытия сделки
-            time_penalty_pips=0.05,     # Штраф за удержание позиции во флете
-            unrealized_delta_weight=0.02,
-            wrong_buy_penalty=1.5,              # Тяжелый штраф за вход без сигнала
-            correct_buy_reward=1.0,             # Базовый бонус за вход по сигналу
-            hold_with_signal_reward=0.3,        # Стимул удерживать сделку по тренду
-            hold_against_signal_penalty=0.5     # Стимул немедленно закрываться при bear_div
+            hold_reward_weight=0.001,           #0.05
+            open_penalty_pips=1.0,              # Стоимость открытия сделки
+            time_penalty_pips=0.02,             # Штраф за удержание позиции во флете
+            unrealized_delta_weight=0.05,
+            wrong_buy_penalty=0.0,             # Тяжелый штраф за вход без сигнала
+            correct_buy_reward=0.1,             # Базовый бонус за вход по сигналу
+            hold_with_signal_reward=0.08,       # Стимул удерживать сделку по тренду
+            hold_against_signal_penalty=0.25    # Стимул немедленно закрываться при bear_div
         )
 
     # Train-eval env: deterministic start, NO random starts (so curve is stable/reproducible)
@@ -93,14 +94,14 @@ def main():
             random_start=False,
             episode_max_steps=None,
             feature_columns=feature_cols,
-            hold_reward_weight=0.005,
-            open_penalty_pips=1.2,      # half a pip per open
-            time_penalty_pips=0.05,     # 0.02 pips per bar in trade
-            unrealized_delta_weight=0.02,
-            wrong_buy_penalty=1.5,
-            correct_buy_reward=1.0,
-            hold_with_signal_reward=0.3,
-            hold_against_signal_penalty=0.5
+            hold_reward_weight=0.001,
+            open_penalty_pips=0,      # half a pip per open
+            time_penalty_pips=0.02,     # 0.02 pips per bar in trade
+            unrealized_delta_weight=0.05,
+            wrong_buy_penalty=0.15,
+            correct_buy_reward=0.1,
+            hold_with_signal_reward=0.08,
+            hold_against_signal_penalty=0.25
         )
 
     # Test-eval env: deterministic
@@ -116,14 +117,14 @@ def main():
             random_start=False,
             episode_max_steps=None,
             feature_columns=feature_cols,
-            hold_reward_weight=0.005,
-            open_penalty_pips=1.2,      # half a pip per open
-            time_penalty_pips=0.05,     # 0.02 pips per bar in trade
-            unrealized_delta_weight=0.02,
-            wrong_buy_penalty=1.5,
-            correct_buy_reward=1.0,
-            hold_with_signal_reward=0.3,
-            hold_against_signal_penalty=0.5
+            hold_reward_weight=0.001,
+            open_penalty_pips=1.0,      # half a pip per open
+            time_penalty_pips=0.02,     # 0.02 pips per bar in trade
+            unrealized_delta_weight=0.05,
+            wrong_buy_penalty=0.15,
+            correct_buy_reward=0.1,
+            hold_with_signal_reward=0.08,
+            hold_against_signal_penalty=0.25
         )
 
     train_vec_env = DummyVecEnv([make_train_env])
@@ -135,10 +136,6 @@ def main():
         policy="MlpPolicy",
         env=train_vec_env,
         verbose=1,
-        n_steps=4096,              # Собираем больше опыта перед обновлением градиента
-        batch_size=128,            # Стабильный размер батча для финансовых рядов
-        gamma=0.995,               # Увеличиваем горизонт планирования (важно для долгого удержания)
-        ent_coef=0.01,             # Коэффициент энтропии заставляет искать оптимальный SL
         tensorboard_log="./tensorboard_log/"
     )
 
@@ -171,8 +168,8 @@ def main():
     for ck in ckpts:
         ck_path = os.path.join(ckpt_dir, ck)
         try:
-            m = PPO.load(ck_path, env=test_eval_env)
-            _, final_eq = evaluate_model(m, test_eval_env)
+            m = PPO.load(ck_path, env=train_eval_env)
+            _, final_eq = evaluate_model(m, train_eval_env)
             print(f"[IS Eval Checkpoint] {ck} -> final equity: {final_eq:.2f}")
             if final_eq > best_equity:
                 best_equity = final_eq
