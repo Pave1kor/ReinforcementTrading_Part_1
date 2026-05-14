@@ -75,7 +75,7 @@ def main():
             open_penalty_pips=1.0,              # Стоимость открытия сделки
             time_penalty_pips=0.02,             # Штраф за удержание позиции во флете
             unrealized_delta_weight=0.05,
-            wrong_buy_penalty=0.0,             # Тяжелый штраф за вход без сигнала
+            wrong_buy_penalty=0.15,             # Тяжелый штраф за вход без сигнала
             correct_buy_reward=0.1,             # Базовый бонус за вход по сигналу
             hold_with_signal_reward=0.08,       # Стимул удерживать сделку по тренду
             hold_against_signal_penalty=0.25    # Стимул немедленно закрываться при bear_div
@@ -95,7 +95,7 @@ def main():
             episode_max_steps=None,
             feature_columns=feature_cols,
             hold_reward_weight=0.001,
-            open_penalty_pips=0,      # half a pip per open
+            open_penalty_pips=1.0,      # half a pip per open
             time_penalty_pips=0.02,     # 0.02 pips per bar in trade
             unrealized_delta_weight=0.05,
             wrong_buy_penalty=0.15,
