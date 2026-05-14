@@ -47,8 +47,8 @@ def main():
     test_df = df.iloc[split_idx:].copy()
 
     # Must match training params
-    SL_OPTS = [10, 15, 25]
-    TP_OPTS = [10, 15, 25]
+    SL_OPTS = [5, 10, 15, 25, 30, 60, 90, 120]
+    TP_OPTS = [9999999]
     WIN = 30
 
     test_env = ForexTradingEnv(
@@ -63,9 +63,13 @@ def main():
             episode_max_steps=None,
             feature_columns=feature_cols,
             hold_reward_weight=0.005,
-            open_penalty_pips=0.5,      # half a pip per open
-            time_penalty_pips=0.02,     # 0.02 pips per bar in trade
-            unrealized_delta_weight=0.0
+            open_penalty_pips=1.2,      # half a pip per open
+            time_penalty_pips=0.05,     # 0.02 pips per bar in trade
+            unrealized_delta_weight=0.02,
+            wrong_buy_penalty=1.5,
+            correct_buy_reward=1.0,
+            hold_with_signal_reward=0.3,
+            hold_against_signal_penalty=0.5
     )
 
     vec_test_env = DummyVecEnv([lambda: test_env])
