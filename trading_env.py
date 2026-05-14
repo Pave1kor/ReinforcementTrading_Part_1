@@ -60,10 +60,10 @@ class ForexTradingEnv(gym.Env):
         hold_reward_weight: float = 0.005,   # tuned below
         open_penalty_pips: float = 1.2,      # NEW: penalty per open
         time_penalty_pips: float = 0.05,     # NEW: cost per bar in a trade
-        correct_buy_reward: float = 0.1,  # Бонус за открытие Long строго по сигналу bull_div
-        wrong_buy_penalty: float = 0.2,   # Тяжелый штраф за покупку без сигнала
-        hold_with_signal_reward: float = 0.05, # Награда за удержание, пока горит bull_div
-        hold_against_signal_penalty: float = 0.1 # Штраф за игнорирование сигнала к выходу (bear_div)
+        correct_buy_reward: float = 1,  # Бонус за открытие Long строго по сигналу bull_div
+        wrong_buy_penalty: float = 1.5,   # Тяжелый штраф за покупку без сигнала
+        hold_with_signal_reward: float = 0.3, # Награда за удержание, пока горит bull_div
+        hold_against_signal_penalty: float = 0.5 # Штраф за игнорирование сигнала к выходу (bear_div)
     ):
         super().__init__()
 
@@ -324,8 +324,8 @@ class ForexTradingEnv(gym.Env):
             net_pips = self._close_position("END_OF_DATA", exit_price)
             return net_pips
 
-        next_high = float(self.df.loc[self.current_step + 1, "High"])
-        next_low = float(self.df.loc[self.current_step + 1, "Low"])
+        next_high = float(self.df.loc[self.current_step, "High"])
+        next_low = float(self.df.loc[self.current_step, "Low"])
 
         if self.position == 1:
             sl_hit = next_low <= self.sl_price
@@ -335,18 +335,6 @@ class ForexTradingEnv(gym.Env):
                 return self._close_position("SL_AND_TP_SAME_BAR_SL_FIRST", self.sl_price)
             elif sl_hit:
                 return self._close_position("SL_HIT", self.sl_price)
-            elif tp_hit:
-                return self._close_position("TP_HIT", self.tp_price)
-        else:
-            sl_hit = next_high >= self.sl_price
-            tp_hit = next_low <= self.tp_price
-            if sl_hit and tp_hit:
-                return self._close_position("SL_AND_TP_SAME_BAR_SL_FIRST", self.sl_price)
-            elif sl_hit:
-                return self._close_position("SL_HIT", self.sl_price)
-            elif tp_hit:
-                return self._close_position("TP_HIT", self.tp_price)
-
         return None
 
     # ----------------------------
@@ -392,8 +380,38 @@ class ForexTradingEnv(gym.Env):
         reward_pips = 0.0
         info = {}
 
-        act_type, direction, sl_pips, _ = self.action_map[int(action)]
+        act_type, _, sl_pips, _ = self.action_map[int(action)]
 
+    # --- ШАГ А: СНАЧАЛА ПРОВЕРЯЕМ СТОП-ЛОСС УЖЕ СУЩЕСТВУЮЩЕЙ ПОЗИЦИИ ---
+    # Проверяем, не выбило ли старую сделку по Low/High текущего бара
+        realized_now = self._check_sl_tp_intrabar_and_maybe_close()
+        if realized_now is not None:
+            reward_pips += realized_now
+            
+            # Фиксируем завершение шага при срабатывании стопа
+            self.current_step += 1
+            if self.current_step >= self.n_steps - 1:
+                self.terminated = True
+            if self.episode_max_steps is not None and self.steps_in_episode >= self.episode_max_steps:
+                self.truncated = True
+
+            self.equity_curve.append(float(self.equity_usd))
+            obs = self._get_observation()
+            reward = float(reward_pips) * self.reward_scale
+        
+            info.update({
+                "equity_usd": float(self.equity_usd),
+                "position": int(self.position),
+                "time_in_trade": int(self.time_in_trade),
+                "reward_pips": float(reward_pips),
+                "last_trade_info": self.last_trade_info
+            })
+        
+            if _GYMNASIUM:
+                return obs, reward, self.terminated, self.truncated, info
+            else:
+                return obs, reward, bool(self.terminated or self.truncated), info
+# Извлекаем сигналы для текущего закрывшегося бара
         is_bull_div = bool(self.df.loc[self.current_step, "bull_div"])
         is_bear_div = bool(self.df.loc[self.current_step, "bear_div"])
         strength_lvl = float(self.df.loc[self.current_step, "strengthLevel"])
@@ -410,13 +428,12 @@ class ForexTradingEnv(gym.Env):
                 slip_pips = self._sample_slippage_pips()
                 slip_price = slip_pips * self.pip_value
                 
-                # Так как шортов нет, позиция всегда равна еденице
                 exit_price = close_price - slip_price
                 # Считаем финансовый результат закрытия
                 reward_pips += self._close_position("MANUAL_CLOSE", exit_price)
 
                 if is_bear_div:
-                    reward_pips += self.correct_buy_reward*strength_lvl * 5.0
+                    reward_pips += self.correct_buy_reward*strength_lvl * 1.0
                 elif is_bull_div:
                     reward_pips -= self.open_penalty_pips
         
@@ -426,11 +443,11 @@ class ForexTradingEnv(gym.Env):
                 
                 if is_bull_div:
             # Хвалим за вход по сигналу, частично компенсируя open_penalty_pips
-                    reward_pips += self.correct_buy_reward * (strength_lvl * 5.0)
+                    reward_pips += self.correct_buy_reward * (strength_lvl * 10.0)
                     reward_pips -= self.open_penalty_pips
                 else:
             # Жестко штрафуем за вход "пальцем в небо" без сигнала дивергенции
-                    reward_pips -= self.wrong_buy_penalty
+                    reward_pips -= self.wrong_buy_penalty*10
             else:
                 if self.allow_flip:
                     close_price = float(self.df.loc[self.current_step, "Close"])
@@ -438,10 +455,7 @@ class ForexTradingEnv(gym.Env):
 
 
         # 2) If position is open, check SL/TP on next bar intrabar
-        realized_now = self._check_sl_tp_intrabar_and_maybe_close()
-        if realized_now is not None:
-            reward_pips += realized_now
-
+        
         # 3) If still open, apply reward shaping based on delta-unrealized pips
         # 3) If still open, apply reward shaping
         if self.position == 1:
@@ -461,11 +475,11 @@ class ForexTradingEnv(gym.Env):
 
             if is_bear_div:
                 # Опасно: агент в Long, но индикатор сигнализирует о медвежьем развороте
-                reward_pips -= self.hold_against_signal_penalty * strength_lvl*5.0
+                reward_pips -= self.hold_against_signal_penalty * strength_lvl*10.0
             elif is_bull_div:
                 # Отлично: агент стоит в Long, и индикатор подтверждает бычью дивергенцию
                 # Дополнительно масштабируем награду в зависимости от уровня силы (strengthLevel)
-                reward_pips += self.hold_with_signal_reward * strength_lvl * 5.0
+                reward_pips += self.hold_with_signal_reward * strength_lvl * 10.0
 
             # (c) small time cost per bar in a trade to avoid infinite holding
             reward_pips -= self.time_penalty_pips
