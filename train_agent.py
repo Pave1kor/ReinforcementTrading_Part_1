@@ -53,7 +53,7 @@ def main():
 
     # ---- Env factories ----
     SL_OPTS = [5, 10, 15, 25, 30, 60, 90, 120]
-    TP_OPTS = [5, 10, 15, 25, 30, 60, 90, 120]
+    TP_OPTS = [9999999]
     WIN = 30
 
     # Train env: random starts to reduce memorization
@@ -70,10 +70,14 @@ def main():
             min_episode_steps=1000,
             episode_max_steps=2000,
             feature_columns=feature_cols,
-            hold_reward_weight=0.0,#0.05
-            open_penalty_pips=0.0,      # 0.5 half a pip per open
-            time_penalty_pips=0.0,     # 0.02 pips per bar in trade
-            unrealized_delta_weight=0.0
+            hold_reward_weight=0.005, #0.05
+            open_penalty_pips=1.2,      # Стоимость открытия сделки
+            time_penalty_pips=0.05,     # Штраф за удержание позиции во флете
+            unrealized_delta_weight=0.02,
+            wrong_buy_penalty=1.5,              # Тяжелый штраф за вход без сигнала
+            correct_buy_reward=1.0,             # Базовый бонус за вход по сигналу
+            hold_with_signal_reward=0.3,        # Стимул удерживать сделку по тренду
+            hold_against_signal_penalty=0.5     # Стимул немедленно закрываться при bear_div
         )
 
     # Train-eval env: deterministic start, NO random starts (so curve is stable/reproducible)
@@ -89,10 +93,14 @@ def main():
             random_start=False,
             episode_max_steps=None,
             feature_columns=feature_cols,
-            hold_reward_weight=0.00,
-            open_penalty_pips=0.0,      # half a pip per open
-            time_penalty_pips=0.0,     # 0.02 pips per bar in trade
-            unrealized_delta_weight=0.0
+            hold_reward_weight=0.005,
+            open_penalty_pips=1.2,      # half a pip per open
+            time_penalty_pips=0.05,     # 0.02 pips per bar in trade
+            unrealized_delta_weight=0.02,
+            wrong_buy_penalty=1.5,
+            correct_buy_reward=1.0,
+            hold_with_signal_reward=0.3,
+            hold_against_signal_penalty=0.5
         )
 
     # Test-eval env: deterministic
@@ -108,10 +116,14 @@ def main():
             random_start=False,
             episode_max_steps=None,
             feature_columns=feature_cols,
-            hold_reward_weight=0.00,
-            open_penalty_pips=0.0,      # half a pip per open
-            time_penalty_pips=0.00,     # 0.02 pips per bar in trade
-            unrealized_delta_weight=0.0
+            hold_reward_weight=0.005,
+            open_penalty_pips=1.2,      # half a pip per open
+            time_penalty_pips=0.05,     # 0.02 pips per bar in trade
+            unrealized_delta_weight=0.02,
+            wrong_buy_penalty=1.5,
+            correct_buy_reward=1.0,
+            hold_with_signal_reward=0.3,
+            hold_against_signal_penalty=0.5
         )
 
     train_vec_env = DummyVecEnv([make_train_env])
@@ -123,6 +135,10 @@ def main():
         policy="MlpPolicy",
         env=train_vec_env,
         verbose=1,
+        n_steps=4096,              # Собираем больше опыта перед обновлением градиента
+        batch_size=128,            # Стабильный размер батча для финансовых рядов
+        gamma=0.995,               # Увеличиваем горизонт планирования (важно для долгого удержания)
+        ent_coef=0.01,             # Коэффициент энтропии заставляет искать оптимальный SL
         tensorboard_log="./tensorboard_log/"
     )
 
@@ -141,8 +157,8 @@ def main():
     model.learn(total_timesteps=total_timesteps, callback=checkpoint_callback)
 
     # ---- Select best model by OOS final equity ----
-    equity_curve_test_last, final_equity_test_last = evaluate_model(model, test_eval_env)
-    print(f"[OOS Eval] Last model final equity: {final_equity_test_last:.2f}")
+    _, final_equity_train_last = evaluate_model(model, train_eval_env)
+    print(f"[IS Eval] Last model final equity on train: {final_equity_train_last:.2f}")
 
     best_equity = -np.inf
     best_path = None
@@ -157,7 +173,7 @@ def main():
         try:
             m = PPO.load(ck_path, env=test_eval_env)
             _, final_eq = evaluate_model(m, test_eval_env)
-            print(f"[OOS Eval] {ck} -> final equity: {final_eq:.2f}")
+            print(f"[IS Eval Checkpoint] {ck} -> final equity: {final_eq:.2f}")
             if final_eq > best_equity:
                 best_equity = final_eq
                 best_path = ck_path
@@ -165,11 +181,11 @@ def main():
             print(f"[Skip] Could not evaluate checkpoint {ck}: {e}")
 
     # Decide best model
-    if best_path is None or final_equity_test_last >= best_equity:
-        print("Using last model as best (by OOS final equity).")
+    if best_path is None or final_equity_train_last >= best_equity:
+        print("Using last model as best (by In-Sample final equity).")
         best_model = model
     else:
-        print(f"Using best checkpoint: {best_path} (OOS final equity: {best_equity:.2f})")
+        print(f"Using best checkpoint: {best_path} (In-Sample final equity: {best_equity:.2f})")
         best_model = PPO.load(best_path, env=train_vec_env)
 
     best_model.save("model_eurusd_best")
