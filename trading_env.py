@@ -58,8 +58,12 @@ class ForexTradingEnv(gym.Env):
         feature_std: np.ndarray | None = None,  # optional normalization (train-fitted)
         allow_flip: bool = False,               # if True, OPEN while in position flips (close+open). Default False.
         hold_reward_weight: float = 0.005,   # tuned below
-        open_penalty_pips: float = 0.5,      # NEW: penalty per open
-        time_penalty_pips: float = 0.02,     # NEW: cost per bar in a trade
+        open_penalty_pips: float = 1.2,      # NEW: penalty per open
+        time_penalty_pips: float = 0.05,     # NEW: cost per bar in a trade
+        correct_buy_reward: float = 0.1,  # Бонус за открытие Long строго по сигналу bull_div
+        wrong_buy_penalty: float = 0.2,   # Тяжелый штраф за покупку без сигнала
+        hold_with_signal_reward: float = 0.05, # Награда за удержание, пока горит bull_div
+        hold_against_signal_penalty: float = 0.1 # Штраф за игнорирование сигнала к выходу (bear_div)
     ):
         super().__init__()
 
@@ -100,6 +104,10 @@ class ForexTradingEnv(gym.Env):
         self.hold_reward_weight = float(hold_reward_weight)
         self.open_penalty_pips = float(open_penalty_pips)
         self.time_penalty_pips = float(time_penalty_pips)
+        self.correct_buy_reward = float(correct_buy_reward)          
+        self.wrong_buy_penalty = float(wrong_buy_penalty)          
+        self.hold_with_signal_reward = float(hold_with_signal_reward)     
+        self.hold_against_signal_penalty = float(hold_against_signal_penalty) 
 
         # Episode handling
         self.random_start = bool(random_start)
@@ -115,12 +123,12 @@ class ForexTradingEnv(gym.Env):
         # --- Actions ---
         # 0: HOLD
         # 1: CLOSE
-        # 2..: OPEN(direction, sl, tp)
+        # 2..: OPEN(direction, sl)
         self.action_map = [("HOLD", None, None, None), ("CLOSE", None, None, None)]
-        for direction in [0, 1]:  # 0=short, 1=long
-            for sl in self.sl_options:
-                for tp in self.tp_options:
-                    self.action_map.append(("OPEN", direction, float(sl), float(tp)))
+
+        for sl in self.sl_options:
+            for tp in self.tp_options:
+                self.action_map.append(("OPEN", 1, float(sl), 999999))
 
         self.action_space = spaces.Discrete(len(self.action_map))
 
@@ -384,11 +392,16 @@ class ForexTradingEnv(gym.Env):
         reward_pips = 0.0
         info = {}
 
-        act_type, direction, sl_pips, tp_pips = self.action_map[int(action)]
+        act_type, direction, sl_pips, _ = self.action_map[int(action)]
 
+        is_bull_div = bool(self.df.loc[self.current_step, "bull_div"])
+        is_bear_div = bool(self.df.loc[self.current_step, "bear_div"])
+        strength_lvl = float(self.df.loc[self.current_step, "strengthLevel"])
+        
         # 1) Apply action logic
         if act_type == "HOLD":
-            pass
+            if self.position == 0 and is_bull_div:
+                reward_pips -= self.wrong_buy_penalty * (strength_lvl * 5.0)
 
         elif act_type == "CLOSE":
             if self.position != 0:
@@ -396,20 +409,32 @@ class ForexTradingEnv(gym.Env):
                 close_price = float(self.df.loc[self.current_step, "Close"])
                 slip_pips = self._sample_slippage_pips()
                 slip_price = slip_pips * self.pip_value
-                exit_price = close_price - slip_price if self.position == 1 else close_price + slip_price
+                
+                # Так как шортов нет, позиция всегда равна еденице
+                exit_price = close_price - slip_price
+                # Считаем финансовый результат закрытия
                 reward_pips += self._close_position("MANUAL_CLOSE", exit_price)
 
+                if is_bear_div:
+                    reward_pips += self.correct_buy_reward*strength_lvl * 5.0
+                elif is_bull_div:
+                    reward_pips -= self.open_penalty_pips
+        
         elif act_type == "OPEN":
             if self.position == 0:
-                self._open_position(direction=direction, sl_pips=sl_pips, tp_pips=tp_pips)
-                # penalty for opening a trade to discourage overtrading
-                reward_pips -= self.open_penalty_pips
+                self._open_position(direction=1, sl_pips=sl_pips, tp_pips=999999)
+                
+                if is_bull_div:
+            # Хвалим за вход по сигналу, частично компенсируя open_penalty_pips
+                    reward_pips += self.correct_buy_reward * (strength_lvl * 5.0)
+                    reward_pips -= self.open_penalty_pips
+                else:
+            # Жестко штрафуем за вход "пальцем в небо" без сигнала дивергенции
+                    reward_pips -= self.wrong_buy_penalty
             else:
                 if self.allow_flip:
                     close_price = float(self.df.loc[self.current_step, "Close"])
                     reward_pips += self._close_position("FLIP_CLOSE", close_price)
-                    self._open_position(direction=direction, sl_pips=sl_pips, tp_pips=tp_pips)
-                    reward_pips -= self.open_penalty_pips
 
 
         # 2) If position is open, check SL/TP on next bar intrabar
@@ -419,7 +444,7 @@ class ForexTradingEnv(gym.Env):
 
         # 3) If still open, apply reward shaping based on delta-unrealized pips
         # 3) If still open, apply reward shaping
-        if self.position != 0:
+        if self.position == 1:
             self.time_in_trade += 1
 
             unreal_now = self._compute_unrealized_pips()
@@ -433,6 +458,14 @@ class ForexTradingEnv(gym.Env):
             # (b) optional shaping on change in unrealized (can keep small or zero)
             if self.unrealized_delta_weight != 0.0:
                 reward_pips += self.unrealized_delta_weight * delta_unreal
+
+            if is_bear_div:
+                # Опасно: агент в Long, но индикатор сигнализирует о медвежьем развороте
+                reward_pips -= self.hold_against_signal_penalty * strength_lvl*5.0
+            elif is_bull_div:
+                # Отлично: агент стоит в Long, и индикатор подтверждает бычью дивергенцию
+                # Дополнительно масштабируем награду в зависимости от уровня силы (strengthLevel)
+                reward_pips += self.hold_with_signal_reward * strength_lvl * 5.0
 
             # (c) small time cost per bar in a trade to avoid infinite holding
             reward_pips -= self.time_penalty_pips

@@ -83,7 +83,7 @@ def load_and_preprocess_data(csv_path: str):
     df["slope_div"] > df["p30"],
     df["slope_div"] > df["p20"],
     ]
-    choices = [9, 8, 7, 6, 5, 4, 3, 2]
+    choices = [0.9, 0.8, 0.7, 0.6, 0.5, 0.4, 0.3, 0.2]
 
     df["strengthLevel"] = np.select(conditions, choices, default=1)
 
