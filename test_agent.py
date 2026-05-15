@@ -40,7 +40,7 @@ def run_one_episode(model, vec_env, deterministic=True):
 
 def main():
     # Choose the dataset you want to evaluate on
-    file_path = "data/test_EURUSD_Candlestick_1_Hour_BID_20.02.2023-22.02.2025"
+    file_path = "data/test_EURUSD_Candlestick_1_Hour_BID_20.02.2023-22.02.2025.csv"
     df, feature_cols = load_and_preprocess_data(file_path)
 
     # If you want a true OOS test here, split and use only the test slice:
@@ -48,29 +48,27 @@ def main():
     test_df = df.iloc[split_idx:].copy()
 
     # Must match training params
-    SL_OPTS = [5, 10, 15, 25, 30, 60, 90, 120]
-    TP_OPTS = [9999999]
+    SL_OPTS = [25, 30, 60, 90, 120]
     WIN = 30
 
     test_env = ForexTradingEnv(
         df=test_df,
-            window_size=WIN,
-            sl_options=SL_OPTS,
-            tp_options=TP_OPTS,
-            spread_pips=1.0,
-            commission_pips=0.0,
-            max_slippage_pips=0.2,
-            random_start=False,
-            episode_max_steps=None,
-            feature_columns=feature_cols,
-            hold_reward_weight=0.005,
-            open_penalty_pips=1.2,      # half a pip per open
-            time_penalty_pips=0.05,     # 0.02 pips per bar in trade
-            unrealized_delta_weight=0.02,
-            wrong_buy_penalty=1.5,
-            correct_buy_reward=1.0,
-            hold_with_signal_reward=0.3,
-            hold_against_signal_penalty=0.5
+        window_size=WIN,
+        sl_options=SL_OPTS,
+        spread_pips=1.0,
+        commission_pips=0.0,
+        max_slippage_pips=0.2,
+        random_start=False,
+        episode_max_steps=None,
+        feature_columns=feature_cols,
+        hold_reward_weight=0.05,
+        open_penalty_pips=0.5,      # half a pip per open
+        time_penalty_pips=0.05,     # 0.05 pips per bar in trade
+        unrealized_delta_weight=0.01,
+        wrong_buy_penalty=1.8,
+        correct_buy_reward=2.5,
+        hold_with_signal_reward=0.2,
+        hold_against_signal_penalty=2.0
     )
 
     vec_test_env = DummyVecEnv([lambda: test_env])
@@ -97,7 +95,7 @@ def main():
     plt.ylabel("Equity ($)")
     plt.legend()
     plt.tight_layout()
-    plt.show()
+    plt.savefig('plot.png') 
 
 
 if __name__ == "__main__":

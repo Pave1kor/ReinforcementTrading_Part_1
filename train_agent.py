@@ -53,8 +53,7 @@ def main():
     print("Testing bars :", len(test_df))
 
     # ---- Env factories ----
-    SL_OPTS = [5, 10, 15, 25, 30, 60, 90, 120]
-    TP_OPTS = [9999999]
+    SL_OPTS = [25, 30, 60, 90, 120]
     WIN = 30
 
     # Train env: random starts to reduce memorization
@@ -63,7 +62,6 @@ def main():
             df=train_df,
             window_size=WIN,
             sl_options=SL_OPTS,
-            tp_options=TP_OPTS,
             spread_pips=1.0,
             commission_pips=0.0,
             max_slippage_pips=0.2,
@@ -71,14 +69,14 @@ def main():
             min_episode_steps=1000,
             episode_max_steps=2048,
             feature_columns=feature_cols,
-            hold_reward_weight=0.001,           #0.05
-            open_penalty_pips=1.0,              # Стоимость открытия сделки
-            time_penalty_pips=0.02,             # Штраф за удержание позиции во флете
-            unrealized_delta_weight=0.05,
-            wrong_buy_penalty=0.15,             # Тяжелый штраф за вход без сигнала
-            correct_buy_reward=0.1,             # Базовый бонус за вход по сигналу
-            hold_with_signal_reward=0.08,       # Стимул удерживать сделку по тренду
-            hold_against_signal_penalty=0.25    # Стимул немедленно закрываться при bear_div
+            hold_reward_weight=0.05,           #0.05
+            open_penalty_pips=0.5,              # Стоимость открытия сделки
+            time_penalty_pips=0.1,             # Штраф за удержание позиции во флете
+            unrealized_delta_weight=0.01,
+            wrong_buy_penalty=1.5,             # Тяжелый штраф за вход без сигнала
+            correct_buy_reward=3.0,             # Базовый бонус за вход по сигналу
+            hold_with_signal_reward=0.3,       # Стимул удерживать сделку по тренду
+            hold_against_signal_penalty=2.0    # Стимул немедленно закрываться при bear_div
         )
 
     # Train-eval env: deterministic start, NO random starts (so curve is stable/reproducible)
@@ -87,21 +85,20 @@ def main():
             df=train_df,
             window_size=WIN,
             sl_options=SL_OPTS,
-            tp_options=TP_OPTS,
             spread_pips=1.0,
             commission_pips=0.0,
             max_slippage_pips=0.2,
             random_start=False,
             episode_max_steps=None,
             feature_columns=feature_cols,
-            hold_reward_weight=0.001,
-            open_penalty_pips=1.0,      # half a pip per open
-            time_penalty_pips=0.02,     # 0.02 pips per bar in trade
-            unrealized_delta_weight=0.05,
-            wrong_buy_penalty=0.15,
-            correct_buy_reward=0.1,
-            hold_with_signal_reward=0.08,
-            hold_against_signal_penalty=0.25
+            hold_reward_weight=0.05,
+            open_penalty_pips=0.5,      # half a pip per open
+            time_penalty_pips=0.1,     # 0.1 pips per bar in trade
+            unrealized_delta_weight=0.01,
+            wrong_buy_penalty=1.5,
+            correct_buy_reward=3.0,
+            hold_with_signal_reward=0.3,
+            hold_against_signal_penalty=2.0
         )
 
     # Test-eval env: deterministic
@@ -110,21 +107,20 @@ def main():
             df=test_df,
             window_size=WIN,
             sl_options=SL_OPTS,
-            tp_options=TP_OPTS,
             spread_pips=1.0,
             commission_pips=0.0,
             max_slippage_pips=0.2,
             random_start=False,
             episode_max_steps=None,
             feature_columns=feature_cols,
-            hold_reward_weight=0.001,
-            open_penalty_pips=1.0,      # half a pip per open
-            time_penalty_pips=0.02,     # 0.02 pips per bar in trade
-            unrealized_delta_weight=0.05,
-            wrong_buy_penalty=0.15,
-            correct_buy_reward=0.1,
-            hold_with_signal_reward=0.08,
-            hold_against_signal_penalty=0.25
+            hold_reward_weight=0.05,
+            open_penalty_pips=0.5,      # half a pip per open
+            time_penalty_pips=0.1,     # 0.1 pips per bar in trade
+            unrealized_delta_weight=0.01,
+            wrong_buy_penalty=1.5,
+            correct_buy_reward=3.0,
+            hold_with_signal_reward=0.3,
+            hold_against_signal_penalty=2.0
         )
 
     train_vec_env = DummyVecEnv([make_train_env])
@@ -203,7 +199,7 @@ def main():
     plt.ylabel("Equity ($)")
     plt.legend()
     plt.tight_layout()
-    plt.show()
+    plt.savefig('plot.png') 
 
 
 if __name__ == "__main__":
