@@ -33,64 +33,71 @@ def load_and_preprocess_data(csv_path: str):
 # ----- Pressure -----
     df["pressure"] = (df["Close"] - df["Low"]) - (df["High"] - df["Close"])
     df["bar_range"] = df["High"] - df["Low"]
-    df["norm_pressure"] = np.where(df["bar_range"] != 0, df["pressure"] / df["bar_range"], 0.0)
+    df["norm_pressure"] = np.where(
+        df["bar_range"] != 0, df["pressure"] / df["bar_range"], 0.0
+        )
 
     # ----- Delta -----
     df["delta"] = df["norm_pressure"] * df["Volume"]
 
     # ----- Средние -----
 
-    df["cvd_avg"] = ta.alma(df["delta"], 100, 0.85, 6)
-    df["price_avg"] = ta.alma(df["Close"], 65, 0.85, 6)
+    df["cvd_avg"] = ta.alma(
+        df["delta"], length=100, sigma=0.85, distribution_offset=4
+        )
+    df["price_avg"] = ta.alma(
+        df["Close"], length=65, sigma=0.85, distribution_offset=4)
 
     # ----- Наклоны (сырые) -----
-    df["cvd_slope_raw"] = ta.linreg(df["cvd_avg"], 8, 0) - ta.linreg(df["cvd_avg"], 8, 1)
-    df["price_slope_raw"] = ta.linreg(df["price_avg"], 8, 0) - ta.linreg(df["price_avg"], 8, 1)
+
+    cvd_linreg_curr = ta.linreg(df["cvd_avg"], length=8, offset=0).squeeze()
+    cvd_linreg_prev = ta.linreg(df["cvd_avg"], length=8, offset=1).squeeze()
+    df["cvd_slope_raw"] = cvd_linreg_curr - cvd_linreg_prev
+
+    price_linreg_curr = ta.linreg(df["price_avg"], length=8, offset=0).squeeze()
+    price_linreg_prev = ta.linreg(df["price_avg"], length=8, offset=1).squeeze()
+    df["price_slope_raw"] = price_linreg_curr - price_linreg_prev
 
     # ----- Нормализация -----
-    df["atr"] = ta.atr(df["High"], df["Low"], df["Close"], length=300)
-    df["avg_vol"] = ta.sma(df["Volume"], length=300)
+    tr_series = ta.true_range(
+        df["High"], df["Low"], df["Close"]
+        )
+    alma_atr = ta.alma(
+        tr_series, length=300, sigma=0.85, distribution_offset=4
+        )
+    alma_vol = ta.alma(
+        df["Volume"], length=300, sigma=0.85, distribution_offset=4
+        )
 
-    df["price_slope"] = np.where(df["atr"] != 0, df["price_slope_raw"] / df["atr"], df["price_slope_raw"])
-    df["cvd_slope"] = np.where(df["avg_vol"] != 0, df["cvd_slope_raw"] / df["avg_vol"], df["cvd_slope_raw"])
+    # 3. Нормирование (обработка деления на ноль через np.where)
+    df["price_slope"] = np.where(
+        alma_atr != 0, 
+        df["price_slope_raw"] / alma_atr, 
+        df["price_slope_raw"]
+    )
 
-    # ----- Дивергенция -----
-    df["slope_sum"] = df["price_slope"].abs() + df["cvd_slope"].abs()
-    base_eps = 1e-10
-    alma_sum = ta.alma(df["slope_sum"], 50, 0.85, 6)
-    df["eps"] = np.maximum(base_eps, alma_sum * 0.01)
-    df["slope_div"] = 2 * (df["price_slope"] - df["cvd_slope"]).abs() / (df["slope_sum"] + df["eps"])
+    df["cvd_slope"] = np.where(
+        alma_vol != 0, 
+        df["cvd_slope_raw"] / alma_vol, 
+        df["cvd_slope_raw"]
+    )
+
+    # 4. RMS-нормирование
+    rms_slope = np.sqrt(
+        (np.power(df["price_slope"], 2) + np.power(df["cvd_slope"], 2)) / 2
+        )
+
+    # 5. Финальный расчет slopeDiv с защитой от деления на ноль
+    df["slope_div"] = np.where(
+        rms_slope != 0, 
+        np.abs(df["price_slope"] - df["cvd_slope"]) / rms_slope, 
+        0
+    )
 
     df["bull_div"] = (df["price_slope"] < 0) & (df["cvd_slope"] > 0)
     df["bear_div"] = (df["price_slope"] > 0) & (df["cvd_slope"] < 0)
     
-    # ----- Уровни силы -----
-    # Вычисляем скользящие перцентили через встроенный метод pandas
-    for p in range(20, 100, 10):
-        df[f"p{p}"] = (
-            df["slope_div"]
-            .rolling(window=300)
-            .quantile(p / 100, interpolation="nearest")
-        )
-
-    # Удаляем NaNs СРАЗУ после оконных функций, чтобы np.select отработал корректно
-    df.dropna(inplace=True)
-
-    # Формируем списки условий и значений для np.select
-    conditions = [
-        df["slope_div"] > df["p90"],
-        df["slope_div"] > df["p80"],
-        df["slope_div"] > df["p70"],
-        df["slope_div"] > df["p60"],
-        df["slope_div"] > df["p50"],
-        df["slope_div"] > df["p40"],
-        df["slope_div"] > df["p30"],
-        df["slope_div"] > df["p20"],
-    ]
-    choices = [0.9, 0.8, 0.7, 0.6, 0.5, 0.4, 0.3, 0.2]
-
-    # Присваиваем уровни силы (если ни одно условие не выполнено, ставится 1)
-    df["strengthLevel"] = np.select(conditions, choices, default=1)
+   
 
     # Drop initial NaNs from indicators
     df.dropna(inplace=True)
@@ -100,7 +107,6 @@ def load_and_preprocess_data(csv_path: str):
         "slope_div",
         "cvd_slope",
         "price_slope",
-        "strengthLevel",
         "bull_div",
         "bear_div",
     ]
