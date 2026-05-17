@@ -47,7 +47,7 @@ class ForexTradingEnv(gym.Env):
         pip_value: float = 0.0001,
         spread_pips: float = 1.0,              # cost in pips per round-trip (approx)
         commission_pips: float = 0.0,          # cost in pips per round-trip
-        max_slippage_pips: float = 0.0,        # random extra pips (0..max) applied on fills
+        max_slippage_pips: float = 0.2,        # random extra pips (0..max) applied on fills
         lot_size: float = 100000.0,            # 1.0 lot = 100k units (for equity in $)
         reward_scale: float = 1.0,             # optional scaling of rewards
         unrealized_delta_weight: float = 0.02, # shaping weight on delta-unrealized while holding
