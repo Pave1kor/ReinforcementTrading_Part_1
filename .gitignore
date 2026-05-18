@@ -1,4 +1,9 @@
 venv_312
 tensorboard_log
 checkpoints
+__pycache__
 model_eurusd_best.zip
+.venv
+venv
+.vs
+
