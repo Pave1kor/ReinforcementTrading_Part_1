@@ -105,16 +105,12 @@ def load_and_preprocess_data(csv_path: str):
         df["Volume"] / alma_vol,
         1.0
     )
-
-    # 4. Кумулятивная дельта
-    df["cvd"] = df["delta"].cumsum()
     
     # Drop initial NaNs from indicators
     df.dropna(inplace=True)
 
     # Columns the AGENT should see 
     feature_cols = [
-        "cvd",
         "relative_volume",
         "price_dist_from_avg",
         "rsi_norm",

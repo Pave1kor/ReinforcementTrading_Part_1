@@ -49,17 +49,17 @@ class ForexTradingEnv(gym.Env):
         commission_pips: float = 0.0,          # cost in pips per round-trip
         max_slippage_pips: float = 0.2,        # random extra pips (0..max) applied on fills
         lot_size: float = 100000.0,            # 1.0 lot = 100k units (for equity in $)
-        reward_scale: float = 1.0,             # optional scaling of rewards
-        unrealized_delta_weight: float = 0.02, # shaping weight on delta-unrealized while holding
+        reward_scale: float = 0.01,             # optional scaling of rewards
+        unrealized_delta_weight: float = 1.0, # shaping weight on delta-unrealized while holding
         random_start: bool = True,
         min_episode_steps: int = 300,          # minimum steps per episode (for random starts)
         episode_max_steps: int | None = None,  # optional cap (truncation)
         feature_mean: np.ndarray | None = None, # optional normalization (train-fitted)
         feature_std: np.ndarray | None = None,  # optional normalization (train-fitted)
         allow_flip: bool = False,               # if True, OPEN while in position flips (close+open). Default False.
-        hold_reward_weight: float = 0.005,   # tuned below
-        open_penalty_pips: float = 0.5,      # NEW: penalty per open
-        time_penalty_pips: float = 0.02,     # NEW: cost per bar in a trade
+        hold_reward_weight: float = 0.0,   # tuned below
+        open_penalty_pips: float = 0.1,      # NEW: penalty per open
+        time_penalty_pips: float = 0.00,     # NEW: cost per bar in a trade
     ):
         super().__init__()
 
@@ -170,11 +170,11 @@ class ForexTradingEnv(gym.Env):
         pos = float(self.position)
         
         # 2. Время в сделке (нормализованное)
-        t_norm = float(self.time_in_trade) / 1000.0
+        t_norm = float(self.time_in_trade) / 100.0
         
         # 3. Незафиксированная прибыль в пипсах
         unreal_pips = float(self._compute_unrealized_pips()) if self.position != 0 else 0.0
-        unreal_scaled = unreal_pips / 100.0  # prevent huge magnitudes
+        unreal_scaled = unreal_pips / 50.0  # prevent huge magnitudes
 
         # 4. Флаг "Рынок свободен"
         is_flat = 1.0 if self.position == 0 else 0.0
@@ -217,13 +217,11 @@ class ForexTradingEnv(gym.Env):
                 pad_rows = self.window_size - base.shape[0]
                 pad = np.tile(base[0], (pad_rows, 1))
                 base = np.vstack([pad, base])
-
-        # Создаем пустую матрицу для состояний агента размера (window_size, 4)
-        state_block = np.zeros((self.window_size, 4), dtype=np.float32)
-
-        # Записываем текущее состояние позиции ТОЛЬКО в самый последний (текущий) шаг окна.
-        # Для всех прошлых шагов состояние будет 0 (нейросеть поймет, что это исторические данные рынка)
-        state_block[-1, :] = self._get_state_features()
+    
+        # Заполняем весь блок окон состояния агента актуальными данными текущего шага, 
+        # чтобы LSTM видела консистентный статус позиции на протяжении всего окна.
+        state_features = self._get_state_features()
+        state_block = np.tile(state_features, (self.window_size, 1))
         
         # Склеиваем историю рынка и очищенный временной блок состояния агента
         obs = np.hstack([base, state_block]).astype(np.float32)
@@ -399,7 +397,7 @@ class ForexTradingEnv(gym.Env):
 
         act_type, direction, sl_pips, tp_pips = self.action_map[int(action)]
 
-        # 1) Apply action logic
+        # 1) Обработка действий
         if act_type == "HOLD":
             pass
 
@@ -425,42 +423,38 @@ class ForexTradingEnv(gym.Env):
                     reward_pips -= self.open_penalty_pips
 
 
-        # 2) If position is open, check SL/TP on next bar intrabar
+        # 2) Проверка внутрибарных SL/TP
         realized_now = self._check_sl_tp_intrabar_and_maybe_close()
         if realized_now is not None:
             reward_pips += realized_now
 
-        # 3) If still open, apply reward shaping based on delta-unrealized pips
-        # 3) If still open, apply reward shaping
+        # 3) Шейпинг наград для удерживаемой позиции
         if self.position != 0:
             self.time_in_trade += 1
 
             unreal_now = self._compute_unrealized_pips()
+
+            # Поощряем только ДВИЖЕНИЕ цены в нужную сторону (Delta PnL)
             delta_unreal = unreal_now - self.prev_unrealized_pips
-
-            # (a) small bonus for holding a winning trade
-            #     proportional to current unrealized profit
-            if unreal_now > 0:
-                reward_pips += self.hold_reward_weight * unreal_now
-
-            # (b) optional shaping on change in unrealized (can keep small or zero)
             if self.unrealized_delta_weight != 0.0:
                 reward_pips += self.unrealized_delta_weight * delta_unreal
 
-            # (c) small time cost per bar in a trade to avoid infinite holding
+            # Дополнительные кастомные бонусы убраны во избежание бесконечного удержания
             reward_pips -= self.time_penalty_pips
-
             self.prev_unrealized_pips = unreal_now
 
 
 
-        # 4) Advance time
+        # 4) Инкремент времени среды
         self.current_step += 1
 
         # 5) Termination / truncation
         if self.current_step >= self.n_steps - 1:
             self.terminated = True
-
+            if self.position != 0: # Форсированное закрытие в конце данных
+                close_price = float(self.df.loc[self.current_step, "Close"])
+                reward_pips += self._close_position("END_OF_DATA", close_price)
+        
         if self.episode_max_steps is not None and self.steps_in_episode >= self.episode_max_steps:
             self.truncated = True
 
@@ -470,7 +464,7 @@ class ForexTradingEnv(gym.Env):
         # 7) Build observation
         obs = self._get_observation()
 
-        # 8) Final reward scaling
+        # Применение скейлинга к итоговому Reward
         reward = float(reward_pips) * self.reward_scale
 
         # 9) Info

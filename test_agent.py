@@ -79,9 +79,9 @@ def main():
             episode_max_steps=None,
             feature_columns=feature_cols,
             hold_reward_weight=0.0,
-            open_penalty_pips=0.5,      # half a pip per open
-            time_penalty_pips=0.02,     # 0.02 pips per bar in trade
-            unrealized_delta_weight=0.0
+            open_penalty_pips=0.1,      # half a pip per open
+            time_penalty_pips=0.0,     # 0.02 pips per bar in trade
+            unrealized_delta_weight=1.0
     )
 
     vec_test_env = DummyVecEnv([lambda: test_env])
