@@ -126,7 +126,7 @@ class ForexTradingEnv(gym.Env):
 
         # Observation features: df columns + 3 state features
         self.base_num_features = len(self.feature_columns)
-        self.state_num_features = 3
+        self.state_num_features = 4
         self.num_features = self.base_num_features + self.state_num_features
 
         self.observation_space = spaces.Box(
@@ -166,12 +166,20 @@ class ForexTradingEnv(gym.Env):
         self.last_trade_info = None
 
     def _get_state_features(self):
-        # position in [-1,0,1], time normalized, unrealized in pips (scaled)
+        # 1. Позиция: -1, 0, 1
         pos = float(self.position)
+        
+        # 2. Время в сделке (нормализованное)
         t_norm = float(self.time_in_trade) / 1000.0
+        
+        # 3. Незафиксированная прибыль в пипсах
         unreal_pips = float(self._compute_unrealized_pips()) if self.position != 0 else 0.0
         unreal_scaled = unreal_pips / 100.0  # prevent huge magnitudes
-        return np.array([pos, t_norm, unreal_scaled], dtype=np.float32)
+
+        # 4. Флаг "Рынок свободен"
+        is_flat = 1.0 if self.position == 0 else 0.0
+
+        return np.array([pos, t_norm, unreal_scaled, is_flat], dtype=np.float32)
 
     def _compute_unrealized_pips(self):
         if self.position == 0 or self.entry_price is None:
@@ -210,12 +218,17 @@ class ForexTradingEnv(gym.Env):
                 pad = np.tile(base[0], (pad_rows, 1))
                 base = np.vstack([pad, base])
 
-        # Append state features (same for each row)
-        state_feat = self._get_state_features()
-        state_block = np.tile(state_feat, (self.window_size, 1))
+        # Создаем пустую матрицу для состояний агента размера (window_size, 4)
+        state_block = np.zeros((self.window_size, 4), dtype=np.float32)
+
+        # Записываем текущее состояние позиции ТОЛЬКО в самый последний (текущий) шаг окна.
+        # Для всех прошлых шагов состояние будет 0 (нейросеть поймет, что это исторические данные рынка)
+        state_block[-1, :] = self._get_state_features()
+        
+        # Склеиваем историю рынка и очищенный временной блок состояния агента
         obs = np.hstack([base, state_block]).astype(np.float32)
 
-        # Optional normalization (only if user passes train-fitted mean/std matching obs dims)
+        # Отключаем деструктивную внешнюю нормализацию (ведь всё готово в indicators.py)
         obs = self._apply_optional_normalization(obs)
 
         return obs

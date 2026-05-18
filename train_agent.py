@@ -11,7 +11,7 @@ from indicators import load_and_preprocess_data
 from trading_env import ForexTradingEnv
 
 
-def evaluate_model(model: RecurrentRecurrentPPO, eval_env: DummyVecEnv, deterministic: bool = True):
+def evaluate_model(model: RecurrentPPO, eval_env: DummyVecEnv, deterministic: bool = True):
     obs = eval_env.reset()
     equity_curve = []
     # Инициализируем скрытые состояния памяти LSTM нулями (агент ничего не помнит на старте)
