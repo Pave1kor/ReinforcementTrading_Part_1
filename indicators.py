@@ -112,7 +112,7 @@ def load_and_preprocess_data(csv_path: str):
     df.dropna(inplace=True)
 
     # Columns the AGENT should see 
-    feature_cols = [
+     feature_cols = [
         "alma_atr",
         "relative_volume",
         "price_dist_from_avg",
@@ -123,5 +123,8 @@ def load_and_preprocess_data(csv_path: str):
         "bull_div",
         "bear_div",
     ]
+    df[feature_cols] = df[feature_cols].shift(1)
+    # Первая строка после сдвига станет NaN – удаляем её
+    df.dropna(inplace=True)
 
     return df, feature_cols

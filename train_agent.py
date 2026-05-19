@@ -2,86 +2,112 @@ import os
 import numpy as np
 import matplotlib.pyplot as plt
 import pandas as pd
-
 from sb3_contrib import RecurrentPPO
 from stable_baselines3.common.vec_env import DummyVecEnv, SubprocVecEnv
-from stable_baselines3.common.callbacks import CheckpointCallback
-
+from stable_baselines3.common.callbacks import CheckpointCallback, EvalCallback
 from indicators import load_and_preprocess_data
 from trading_env import ForexTradingEnv
 
+# Вспомогательные функции для расчёта метрик
+def calculate_metrics(equity_curve: list, trades: list, initial_capital: float = 10000.0):
+    """Рассчитывает основные торговые метрики."""
+    equity = np.array(equity_curve)
+    if len(equity) < 2:
+        return {}
+    returns = np.diff(equity) / equity[:-1]
+    # Sharpe (годовой, безрисковая 0)
+    sharpe = np.sqrt(252 * 24) * np.mean(returns) / np.std(returns) if np.std(returns) > 0 else 0.0
+    # Sortino (только отрицательные отклонения)
+    neg_returns = returns[returns < 0]
+    sortino = np.sqrt(252 * 24) * np.mean(returns) / np.std(neg_returns) if len(neg_returns) > 0 and np.std(neg_returns) > 0 else 0.0
+    # Max Drawdown
+    peak = np.maximum.accumulate(equity)
+    drawdown = (peak - equity) / peak
+    max_dd = np.max(drawdown)
+    # Calmar (annual return / maxDD)
+    total_return = (equity[-1] - initial_capital) / initial_capital
+    annual_return = (1 + total_return) ** (252 * 24 / len(equity)) - 1 if len(equity) > 0 else 0
+    calmar = annual_return / max_dd if max_dd > 0 else np.inf
+    # Торговые метрики
+    if trades:
+        trades_df = pd.DataFrame(trades)
+        net_pips = trades_df["net_pips"].values
+        profit_factor = trades_df[trades_df["net_pips"] > 0]["net_pips"].sum() / abs(trades_df[trades_df["net_pips"] < 0]["net_pips"].sum()) if (trades_df["net_pips"] < 0).sum() > 0 else np.inf
+        win_rate = (trades_df["net_pips"] > 0).mean()
+        avg_trade = np.mean(net_pips)
+        total_trades = len(trades_df)
+    else:
+        profit_factor = 0.0
+        win_rate = 0.0
+        avg_trade = 0.0
+        total_trades = 0
 
-def evaluate_model(model: RecurrentPPO, eval_env: DummyVecEnv, deterministic: bool = True):
-    # Это автоматически перестроит размерность скрытых состояний LSTM под num_envs = 1.
-    model.set_env(eval_env, force_reset=False)
+    return {
+        "sharpe_ratio": sharpe,
+        "sortino_ratio": sortino,
+        "max_drawdown_pct": max_dd,
+        "calmar_ratio": calmar,
+        "profit_factor": profit_factor,
+        "win_rate": win_rate,
+        "avg_trade_pips": avg_trade,
+        "total_trades": total_trades,
+        "final_equity": equity[-1]
+    }
+
+def evaluate_model(model, eval_env, deterministic=True):
+    """Запускает один эпизод и возвращает кривую эквити и список сделок."""
     obs = eval_env.reset()
     equity_curve = []
-
+    closed_trades = []
     lstm_states = None
     episode_starts = np.ones((eval_env.num_envs,), dtype=bool)
 
     while True:
-        action, lstm_states = model.predict(
-            obs, 
-            state=lstm_states, 
-            episode_start=episode_starts, 
-            deterministic=deterministic
-        )
-
+        action, lstm_states = model.predict(obs, state=lstm_states, episode_start=episode_starts, deterministic=deterministic)
         obs, rewards, dones, infos = eval_env.step(action)
         done = bool(dones[0])
-
-        # Передаем реальный статус завершения на следующий шаг для LSTM
         episode_starts = dones
-
-        # Извлекаем словарь info для единственной среды в векторе
         info = infos[0]
 
         if done:
-            # Если это последний шаг, вытаскиваем финальное эквити из словаря info
             if isinstance(info, dict) and "equity_usd" in info:
                 equity_curve.append(float(info["equity_usd"]))
-            elif isinstance(info, dict) and "terminal_observation" in info and "equity_usd" in info["terminal_observation"]:
-                equity_curve.append(float(info["terminal_observation"]["equity_usd"]))
-            else:
-                if equity_curve:
-                    equity_curve.append(equity_curve[-1])
-            break # Мгновенно выходим из цикла
+            elif equity_curve:
+                equity_curve.append(equity_curve[-1])
+            if isinstance(info, dict) and "last_trade_info" in info:
+                trade_info = info["last_trade_info"]
+                if isinstance(trade_info, dict) and trade_info.get("event") == "CLOSE":
+                    closed_trades.append(trade_info)
+            break
         else:
-            # Если эпизод продолжается, берем текущее эквити из ЖИВОЙ среды eval_env
-            equity_curve.append(float(eval_env.get_attr("equity_usd")[0]))
-
-    final_equity = float(equity_curve[-1])
-    return equity_curve, final_equity
-
-
+            equity_curve.append(eval_env.get_attr("equity_usd")[0])
+            trade_info = eval_env.get_attr("last_trade_info")[0]
+            if isinstance(trade_info, dict) and trade_info.get("event") == "CLOSE":
+                if not closed_trades or closed_trades[-1] != trade_info:
+                    closed_trades.append(trade_info)
+    return equity_curve, closed_trades
 
 def main():
-    #file_path = "data/EURUSD_15 Mins_Ask_2020.12.06_2025.12.12.csv"
-    file_path = "data/test_EURUSD_Candlestick_1_Hour_BID_20.02.2023-22.02.2025.csv"
+    # Загрузка и предобработка данных
+    file_path = "data/EURUSD_Candlestick_1_Hour_BID_01.07.2020-15.07.2023.csv"
     df, feature_cols = load_and_preprocess_data(file_path)
 
+    # Разбиение (простое 80/20 – для walk‑forward нужна циклическая логика, здесь для краткости оставляем простое)
     split_idx = int(len(df) * 0.8)
     train_df = df.iloc[:split_idx].copy()
     test_df = df.iloc[split_idx:].copy()
 
-    print("Training bars:", len(train_df))
-    print("Testing bars :", len(test_df))
-
-    # Извлекаем признаки для расчета параметров нормализации (БЕЗ учета таргетов/цен, если нужно)
-    # Считаем среднее и дисперсию СТРОГО на обучающей выборке (Защита от Data Leakage)
-    train_features_df = train_df[feature_cols].apply(pd.to_numeric, errors='coerce').fillna(0.0)
-    train_features = train_features_df.values.astype(np.float32)
+    # Нормализация на train
+    train_features = train_df[feature_cols].values.astype(np.float32)
     train_mean = np.mean(train_features, axis=0)
     train_std = np.std(train_features, axis=0)
 
-    # ---- Env factories ----
+    # Параметры среды
     SL_OPTS = [1.0, 1.5]
     TP_OPTS = [2.0, 3.5]
     WIN = 60
-    NUM_ENVS = 4  # Задействуем 4 параллельных потока (FPS вырастет до 160-200+)
-    
-    # Train env: random starts to reduce memorization
+    NUM_ENVS = 4
+
     def make_train_env():
         return ForexTradingEnv(
             df=train_df,
@@ -94,17 +120,17 @@ def main():
             random_start=True,
             min_episode_steps=300,
             episode_max_steps=800,
-            feature_mean=train_mean, 
-            feature_std=train_std,    
+            feature_mean=train_mean,
+            feature_std=train_std,
             feature_columns=feature_cols,
-            open_penalty_pips=0.1,      # 0.5 half a pip per open
-            time_penalty_pips=0.005,     # 0.02 pips per bar in trade
+            open_penalty_pips=0.1,
+            time_penalty_pips=0.005,
+            unrealized_reward_coef=0.1
         )
 
-    # Train-eval env: deterministic start, NO random starts (so curve is stable/reproducible)
-    def make_train_eval_env():
+    def make_eval_env():
         return ForexTradingEnv(
-            df=train_df,
+            df=train_df,   # валидация на том же train, но без random_start
             window_size=WIN,
             sl_options=SL_OPTS,
             tp_options=TP_OPTS,
@@ -116,12 +142,12 @@ def main():
             feature_mean=train_mean,
             feature_std=train_std,
             feature_columns=feature_cols,
-            open_penalty_pips=0.1,      # half a pip per open
-            time_penalty_pips=0.005,     # 0.02 pips per bar in trade
+            open_penalty_pips=0.1,
+            time_penalty_pips=0.005,
+            unrealized_reward_coef=0.1
         )
 
-    # Test-eval env: deterministic
-    def make_test_eval_env():
+    def make_test_env():
         return ForexTradingEnv(
             df=test_df,
             window_size=WIN,
@@ -132,29 +158,24 @@ def main():
             max_slippage_pips=0.5,
             random_start=False,
             episode_max_steps=None,
+            feature_mean=train_mean,
             feature_std=train_std,
-            feature_mean=train_mean, 
             feature_columns=feature_cols,
-            open_penalty_pips=0.1,      # half a pip per open
-            time_penalty_pips=0.005,     # 0.02 pips per bar in trade
+            open_penalty_pips=0.1,
+            time_penalty_pips=0.005,
+            unrealized_reward_coef=0.1
         )
 
     train_vec_env = SubprocVecEnv([lambda i=i: make_train_env() for i in range(NUM_ENVS)])
-    train_eval_env = DummyVecEnv([make_train_eval_env])
-    test_eval_env = DummyVecEnv([make_test_eval_env])
+    eval_env = DummyVecEnv([make_eval_env])
 
+    # Политика LSTM
     policy_kwargs = dict(
-        net_arch=dict(
-            shared=[64],
-            pi=[32], 
-            vf=[32]
-        ),
+        net_arch=dict(shared=[64], pi=[32], vf=[32]),
         lstm_hidden_size=48,
         n_lstm_layers=1
     )
 
-
-    # ---- Model ----
     model = RecurrentPPO(
         policy="MlpLstmPolicy",
         env=train_vec_env,
@@ -163,7 +184,7 @@ def main():
         policy_kwargs=policy_kwargs,
         ent_coef=0.02,
         learning_rate=1e-4,
-        n_steps= 1024,
+        n_steps=1024,
         batch_size=256,
         n_epochs=4,
         gamma=0.99,
@@ -172,57 +193,37 @@ def main():
         vf_coef=0.5
     )
 
-    # ---- Checkpoints ----
-    ckpt_dir = "./checkpoints"
-    os.makedirs(ckpt_dir, exist_ok=True)
+    checkpoint_callback = CheckpointCallback(save_freq=50_000, save_path="./checkpoints", name_prefix="RecurrentPPO_eurusd")
+    eval_callback = EvalCallback(eval_env, best_model_save_path="./best_model", log_path="./eval_log", eval_freq=25_000, deterministic=True, render=False)
 
-    CKPT_PREFIX = "RecurrentPPO_eurusd"
-    checkpoint_callback = CheckpointCallback(
-        save_freq=50_000,
-        save_path=ckpt_dir,
-        name_prefix=CKPT_PREFIX
-    )
+    total_timesteps = 500_000
+    model.learn(total_timesteps=total_timesteps, callback=[checkpoint_callback, eval_callback])
 
-    # ---- Train ----
-    total_timesteps = 500000
-    model.learn(total_timesteps=total_timesteps, callback=checkpoint_callback)
+    # Финальное тестирование на OOS
+    best_model = RecurrentPPO.load("./best_model/best_model.zip")
+    test_env = DummyVecEnv([make_test_env])
+    equity_test, trades_test = evaluate_model(best_model, test_env, deterministic=True)
 
-    # ---- Select best model by OOS final equity ----
-    model.save("model_eurusd_best")
-    print("Model saved: model_eurusd_best")
+    # Расчёт метрик
+    metrics = calculate_metrics(equity_test, trades_test)
+    print("\n========== METRICS ON TEST SET ==========")
+    for k, v in metrics.items():
+        print(f"{k}: {v:.4f}" if isinstance(v, float) else f"{k}: {v}")
 
-    # ---- Plot BOTH: in-sample vs out-of-sample ----
-    plot_model_train = RecurrentPPO.load("model_eurusd_best", env=train_eval_env)
-    equity_curve_train, final_equity_train = evaluate_model(plot_model_train, train_eval_env)
-    
-    plot_model_test = RecurrentPPO.load("model_eurusd_best", env=test_eval_env)
-    equity_curve_test, final_equity_test = evaluate_model(plot_model_test, test_eval_env)
-
-
-    print(f"[IS Eval]  Final equity (train): {final_equity_train:.2f}")
-    print(f"[OOS Eval] Final equity (test) : {final_equity_test:.2f}")
-
-    plt.figure(figsize=(12, 6))
-    plt.plot(equity_curve_train, label=f"Train (in-sample) equity: {final_equity_train:.2f}$")
-    plt.title("Train (In-Sample) Equity Curve - Best Model")
+    # Сохраняем график и сделки
+    plt.figure(figsize=(12,6))
+    plt.plot(equity_test, label=f"Test Equity Final: {equity_test[-1]:.2f}")
+    plt.title("Out-of-Sample Equity Curve")
     plt.xlabel("Steps")
-    plt.ylabel("Equity ($)")
+    plt.ylabel("Equity (USD)")
     plt.legend()
-    plt.grid(True, alpha=0.3)
-    plt.tight_layout()
-    plt.savefig("model1_train_clean.png")
+    plt.grid(alpha=0.3)
+    plt.savefig("test_equity_curve.png")
+    plt.show()
 
-    plt.figure(figsize=(12, 6))
-    plt.plot(equity_curve_test, label=f"Test (out-of-sample) equity: {final_equity_test:.2f}$", color="orange")
-    plt.title("Test (Out-of-Sample) Equity Curve - Best Model")
-    plt.xlabel("Steps")
-    plt.ylabel("Equity ($)")
-    plt.legend()
-    plt.grid(True, alpha=0.3)
-    plt.tight_layout()
-    plt.savefig("model1_test_clean.png")
-
-
+    if trades_test:
+        pd.DataFrame(trades_test).to_csv("test_trades.csv", index=False)
+        print("Trades saved to test_trades.csv")
 
 if __name__ == "__main__":
     main()
