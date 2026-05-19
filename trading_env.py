@@ -1,10 +1,7 @@
 # trading_env.py
-
 from __future__ import annotations
-
 import numpy as np
 
-# Prefer gymnasium if available (SB3 supports it), fallback to gym
 try:
     import gymnasium as gym
     from gymnasium import spaces
@@ -17,9 +14,8 @@ except ImportError:
 
 class ForexTradingEnv(gym.Env):
     """
-    RL Forex Trading Environment (Position-Persistent) - Clean & Optimized Version
+    RL Forex Trading Environment (Position-Persistent) - Clean, Fixed & Optimized Version
     """
-
     metadata = {"render_modes": ["human"]}
 
     def __init__(
@@ -64,8 +60,6 @@ class ForexTradingEnv(gym.Env):
 
         self.window_size = int(window_size)
         self.pip_value = float(pip_value)
-
-        # Friction
         self.spread_pips = float(spread_pips)
         self.commission_pips = float(commission_pips)
         self.max_slippage_pips = float(max_slippage_pips)
@@ -73,43 +67,33 @@ class ForexTradingEnv(gym.Env):
         self.lot_size = float(lot_size)
         self.usd_per_pip = self.pip_value * self.lot_size
 
-        # Reward handling
         self.reward_scale = float(reward_scale)
         self.open_penalty_pips = float(open_penalty_pips)
         self.time_penalty_pips = float(time_penalty_pips)
 
-        # Episode handling
         self.random_start = bool(random_start)
         self.min_episode_steps = int(min_episode_steps)
         self.episode_max_steps = episode_max_steps if episode_max_steps is None else int(episode_max_steps)
 
-        # Normalization
         self.feature_mean = feature_mean
         self.feature_std = feature_std
-
         self.allow_flip = bool(allow_flip)
 
-        # --- Actions ---
+        # Actions map construction
         self.action_map = [("HOLD", None, None, None), ("CLOSE", None, None, None)]
-        for direction in [0, 1]:  # 0=short, 1=long
+        for direction in [1, -1]:  # 1 = Long, -1 = Short для явной математики
             for sl in self.sl_options:
                 for tp in self.tp_options:
                     self.action_map.append(("OPEN", direction, float(sl), float(tp)))
 
         self.action_space = spaces.Discrete(len(self.action_map))
-
-        # Dimensions
         self.base_num_features = len(self.feature_columns)
         self.state_num_features = 5
         self.num_features = self.base_num_features + self.state_num_features
 
         self.observation_space = spaces.Box(
-            low=-np.inf,
-            high=np.inf,
-            shape=(self.window_size, self.num_features),
-            dtype=np.float32
+            low=-np.inf, high=np.inf, shape=(self.window_size, self.num_features), dtype=np.float32
         )
-
         self._reset_state()
 
     def _reset_state(self):
@@ -117,40 +101,31 @@ class ForexTradingEnv(gym.Env):
         self.steps_in_episode = 0
         self.terminated = False
         self.truncated = False
-
         self.position = 0              
         self.entry_price = None
         self.sl_price = None
         self.tp_price = None
         self.time_in_trade = 0
         self.entry_atr = 0.0
-
         self.initial_equity_usd = 10000.0
         self.equity_usd = self.initial_equity_usd
-
         self.equity_curve = []
         self.last_trade_info = None
 
     def _get_state_features(self):
         pos = float(self.position)
         t_norm = float(self.time_in_trade) / 100.0
-        
         unreal_pips = float(self._compute_unrealized_pips()) if self.position != 0 else 0.0
         unreal_scaled = unreal_pips / 50.0  
-
         is_flat = 1.0 if self.position == 0 else 0.0
-        entry_atr_scaled = (self.entry_atr / self.pip_value) / 20.0
-
+        entry_atr_scaled = (self.entry_atr / self.pip_value) / 20.0 if self.pip_value != 0 else 0.0
         return np.array([pos, t_norm, unreal_scaled, is_flat, entry_atr_scaled], dtype=np.float32)
 
     def _compute_unrealized_pips(self):
         if self.position == 0 or self.entry_price is None:
             return 0.0
         close_price = float(self.df.loc[self.current_step, "Close"])
-        if self.position == 1:
-            pnl_price = close_price - self.entry_price
-        else:
-            pnl_price = self.entry_price - close_price
+        pnl_price = (close_price - self.entry_price) if self.position == 1 else (self.entry_price - close_price)
         return pnl_price / self.pip_value
 
     def _apply_optional_normalization(self, obs: np.ndarray) -> np.ndarray:
@@ -162,33 +137,20 @@ class ForexTradingEnv(gym.Env):
         return (obs - mean) / std
 
     def _get_observation(self):
-        # Корректный срез рыночного окна
-        start = self.current_step - self.window_size + 1
-        if start < 0:
-            start = 0
-
-        obs_df = self.df.iloc[start:self.current_step+1].copy()
-        obs_df = obs_df[self.feature_columns]
-
-        if len(obs_df) == 0:
-            base = np.tile(self.df.iloc[0].values.astype(np.float32), (self.window_size, 1))
-        else:
-            base = obs_df.values.astype(np.float32)
-            if base.shape[0] < self.window_size:
-                pad_rows = self.window_size - base.shape[0]
-                pad = np.tile(base[0], (pad_rows, 1))
-                base = np.vstack([pad, base])
+        start = max(0, self.current_step - self.window_size + 1)
+        obs_df = self.df.iloc[start:self.current_step+1][self.feature_columns]
+        base = obs_df.values.astype(np.float32)
+        
+        if base.shape[0] < self.window_size:
+            pad_rows = self.window_size - base.shape[0]
+            pad = np.tile(base[0], (pad_rows, 1))
+            base = np.vstack([pad, base])
     
         base = self._apply_optional_normalization(base)
-        
-        # Передаем текущий вектор состояния агента на весь блок окна
-        state_block = np.zeros((self.window_size, self.state_num_features), dtype=np.float32)
         current_state_features = self._get_state_features()
-        for i in range(self.window_size):
-            state_block[i, :] = current_state_features
+        state_block = np.tile(current_state_features, (self.window_size, 1))
 
-        obs = np.hstack([base, state_block]).astype(np.float32)
-        return obs
+        return np.hstack([base, state_block]).astype(np.float32)
 
     def _sample_slippage_pips(self) -> float:
         if self.max_slippage_pips <= 0:
@@ -201,16 +163,13 @@ class ForexTradingEnv(gym.Env):
     def _open_position(self, direction: int, sl_pips: float, tp_pips: float):
         close_price = float(self.df.loc[self.current_step, "Close"])
         current_atr = float(self.df.loc[self.current_step, "alma_atr"])
-        
         if current_atr <= 0:
             current_atr = 15.0 * self.pip_value 
 
-        slip_pips = self._sample_slippage_pips()
-        slip_price = slip_pips * self.pip_value
+        slip_price = self._sample_slippage_pips() * self.pip_value
 
         if direction == 1:  
             entry = close_price + slip_price
-            # Считаем динамические уровни цен
             sl_price = entry - (sl_pips * current_atr)
             tp_price = entry + (tp_pips * current_atr)
             self.position = 1
@@ -237,12 +196,8 @@ class ForexTradingEnv(gym.Env):
         }
 
     def _close_position(self, reason: str, exit_price: float):
-        if self.position == 1:
-            pnl_price = exit_price - self.entry_price
-        else:
-            pnl_price = self.entry_price - exit_price
+        pnl_price = (exit_price - self.entry_price) if self.position == 1 else (self.entry_price - exit_price)
         realized_pips = pnl_price / self.pip_value
-
         cost_pips = self._cost_pips_round_trip()
         net_pips = realized_pips - cost_pips
         self.equity_usd += net_pips * self.usd_per_pip
@@ -266,11 +221,10 @@ class ForexTradingEnv(gym.Env):
         self.sl_price = None
         self.tp_price = None
         self.time_in_trade = 0
-
         self.last_trade_info = trade_info
         return net_pips
 
-    def _check_sl_tp_intrabar_and_maybe_close(self) -> float:
+    def _check_sl_tp_intrabar_and_maybe_close(self) -> float | None:
         if self.position == 0 or self.current_step >= self.n_steps:
             return None
 
@@ -280,21 +234,17 @@ class ForexTradingEnv(gym.Env):
         if self.position == 1:
             sl_hit = low <= self.sl_price
             tp_hit = high >= self.tp_price
-            if sl_hit and tp_hit:
-                return self._close_position("SL_AND_TP_SAME_BAR_SL_FIRST", self.sl_price)
-            elif sl_hit:
-                return self._close_position("SL_HIT", self.sl_price)
-            elif tp_hit:
-                return self._close_position("TP_HIT", self.tp_price)
         else:
             sl_hit = high >= self.sl_price
             tp_hit = low <= self.tp_price
-            if sl_hit and tp_hit:
-                return self._close_position("SL_AND_TP_SAME_BAR_SL_FIRST", self.sl_price)
-            elif sl_hit:
-                return self._close_position("SL_HIT", self.sl_price)
-            elif tp_hit:
-                return self._close_position("TP_HIT", self.tp_price)
+
+        if sl_hit and tp_hit:
+            # Консервативный подход: при одновременном касании засчитываем худший исход (SL)
+            return self._close_position("SL_AND_TP_SAME_BAR_CONSERVATIVE", self.sl_price)
+        elif sl_hit:
+            return self._close_position("SL_HIT", self.sl_price)
+        elif tp_hit:
+            return self._close_position("TP_HIT", self.tp_price)
 
         return None
 
@@ -310,55 +260,45 @@ class ForexTradingEnv(gym.Env):
 
         self.steps_in_episode = 0
         obs = self._get_observation()
-
-        if _GYMNASIUM:
-            return obs, {}
-        return obs
+        return (obs, {}) if _GYMNASIUM else obs
 
     def step(self, action: int):
         if self.terminated or self.truncated:
             obs = self._get_observation()
-            if _GYMNASIUM:
-                return obs, 0.0, True, False, {}
-            return obs, 0.0, True, {}
+            return (obs, 0.0, True, False, {}) if _GYMNASIUM else (obs, 0.0, True, {})
 
         self.steps_in_episode += 1
         reward_pips = 0.0
         info = {}
+        self.last_trade_info = None  # Сбрасываем лог перед шагом
 
         act_type, direction, sl_pips, tp_pips = self.action_map[int(action)]
+        position_changed_this_step = False
 
-        # 1) Обработка торговых приказов
         if act_type == "CLOSE" and self.position != 0:
             close_price = float(self.df.loc[self.current_step, "Close"])
             reward_pips += self._close_position("MANUAL_CLOSE", close_price)
-
+            position_changed_this_step = True
         elif act_type == "OPEN" and self.position == 0:
             self._open_position(direction=direction, sl_pips=sl_pips, tp_pips=tp_pips)
             reward_pips -= self.open_penalty_pips
-
-        elif act_type == "OPEN" and self.allow_flip and self.position != 0:
+        elif act_type == "OPEN" and self.allow_flip and self.position != 0 and self.position != direction:
             close_price = float(self.df.loc[self.current_step, "Close"])
             reward_pips += self._close_position("FLIP_CLOSE", close_price)
             self._open_position(direction=direction, sl_pips=sl_pips, tp_pips=tp_pips)
             reward_pips -= self.open_penalty_pips
 
-        # 2) Проверка авто-выходов на текущем баре
-        if self.position != 0:
+        # Intrabar проверка выполняется только если позиция удержана или только что открыта
+        if self.position != 0 and not position_changed_this_step:
             self.time_in_trade += 1
             reward_pips -= self.time_penalty_pips
-            
             realized_now = self._check_sl_tp_intrabar_and_maybe_close()
             if realized_now is not None:
                 reward_pips += realized_now
 
-        # 3) Логируем эквити строго ДО инкремента шага
         self.equity_curve.append(float(self.equity_usd))
-
-        # 4) Инкремент временного шага
         self.current_step += 1
 
-        # 5) Проверка условий конца данных
         if self.current_step >= self.n_steps - 1:
             self.terminated = True
             if self.position != 0:
@@ -368,7 +308,6 @@ class ForexTradingEnv(gym.Env):
         if self.episode_max_steps is not None and self.steps_in_episode >= self.episode_max_steps:
             self.truncated = True
 
-        # 6) Генерация финального наблюдения и награды
         obs = self._get_observation()
         reward = float(reward_pips) * self.reward_scale
 
@@ -382,6 +321,4 @@ class ForexTradingEnv(gym.Env):
 
         if _GYMNASIUM:
             return obs, reward, self.terminated, self.truncated, info
-        else:
-            done = bool(self.terminated or self.truncated)
-            return obs, reward, done, info
+        return obs, reward, bool(self.terminated or self.truncated), info
