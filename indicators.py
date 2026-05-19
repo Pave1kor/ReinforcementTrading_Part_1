@@ -63,23 +63,23 @@ def load_and_preprocess_data(csv_path: str):
     tr_series = ta.true_range(
         df["High"], df["Low"], df["Close"]
         )
-    alma_atr = ta.alma(
+    df["alma_atr"] = ta.alma(
         tr_series, length=300, sigma=0.85, distribution_offset=4
         )
-    alma_vol = ta.alma(
+    df["alma_vol"] = ta.alma(
         df["Volume"], length=300, sigma=0.85, distribution_offset=4
         )
 
     # 3. Нормирование (обработка деления на ноль через np.where)
     df["price_slope"] = np.where(
-        alma_atr != 0, 
-        df["price_slope_raw"] / alma_atr, 
+        df["alma_atr"] != 0, 
+        df["price_slope_raw"] / df["alma_atr"], 
         df["price_slope_raw"]
     )
 
     df["cvd_slope"] = np.where(
-        alma_vol != 0, 
-        df["cvd_slope_raw"] / alma_vol, 
+        df["alma_vol"] != 0, 
+        df["cvd_slope_raw"] / df["alma_vol"], 
         df["cvd_slope_raw"]
     )
 
@@ -94,23 +94,26 @@ def load_and_preprocess_data(csv_path: str):
     # 2. Положение цены внутри диапазона волатильности (аналог Bollinger Bands %B, но через ATR)
     # Показывает, насколько цена отклонилась от своего среднего значения в масштабе текущей волатильности
     df["price_dist_from_avg"] = np.where(
-        alma_atr != 0, 
-        (df["Close"] - df["price_avg"]) / alma_atr, 
+        df["alma_atr"] != 0, 
+        (df["Close"] - df["price_avg"]) / df["alma_atr"], 
         0.0
     )
     
     # 3. Относительный объем (Текущий объем делим на средний исторический объем)
     df["relative_volume"] = np.where(
-        alma_vol != 0,
-        df["Volume"] / alma_vol,
+        df["alma_vol"] != 0,
+        df["Volume"] / df["alma_vol"],
         1.0
     )
+
+    df["alma_atr"] = df["alma_atr"].bfill().fillna(0.0001)
     
     # Drop initial NaNs from indicators
     df.dropna(inplace=True)
 
     # Columns the AGENT should see 
     feature_cols = [
+        "alma_atr",
         "relative_volume",
         "price_dist_from_avg",
         "rsi_norm",

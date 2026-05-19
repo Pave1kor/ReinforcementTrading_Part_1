@@ -77,8 +77,8 @@ def main():
     train_std = np.std(train_features, axis=0)
 
     # Must match training params
-    SL_OPTS = [30, 90]
-    TP_OPTS = [30, 90]
+    SL_OPTS = [1.0, 1.5]
+    TP_OPTS = [2.0, 3.5]
     WIN = 60
 
     test_env = ForexTradingEnv(
@@ -94,10 +94,8 @@ def main():
             feature_columns=feature_cols,
             feature_mean=train_mean, 
             feature_std=train_std,  
-            hold_reward_weight=0.0,
             open_penalty_pips=0.1,      # half a pip per open
-            time_penalty_pips=0.0,     # 0.02 pips per bar in trade
-            unrealized_delta_weight=1.0
+            time_penalty_pips=0.005,     # 0.02 pips per bar in trade
     )
 
     vec_test_env = DummyVecEnv([lambda: test_env])

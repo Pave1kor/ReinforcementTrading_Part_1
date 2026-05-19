@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 import os
 import numpy as np
 import matplotlib.pyplot as plt
@@ -77,8 +76,8 @@ def main():
     train_std = np.std(train_features, axis=0)
 
     # ---- Env factories ----
-    SL_OPTS = [30, 90]
-    TP_OPTS = [30,90]
+    SL_OPTS = [1.0, 1.5]
+    TP_OPTS = [2.0, 3.5]
     WIN = 60
     NUM_ENVS = 4  # Задействуем 4 параллельных потока (FPS вырастет до 160-200+)
     
@@ -93,15 +92,13 @@ def main():
             commission_pips=0.0,
             max_slippage_pips=0.5,
             random_start=True,
-            min_episode_steps=1000,
-            episode_max_steps=None,
+            min_episode_steps=300,
+            episode_max_steps=800,
             feature_mean=train_mean, 
             feature_std=train_std,    
             feature_columns=feature_cols,
-            hold_reward_weight=0.05,#0.05
             open_penalty_pips=0.1,      # 0.5 half a pip per open
-            time_penalty_pips=0.0,     # 0.02 pips per bar in trade
-            unrealized_delta_weight=1.0
+            time_penalty_pips=0.005,     # 0.02 pips per bar in trade
         )
 
     # Train-eval env: deterministic start, NO random starts (so curve is stable/reproducible)
@@ -119,10 +116,8 @@ def main():
             feature_mean=train_mean,
             feature_std=train_std,
             feature_columns=feature_cols,
-            hold_reward_weight=0.05,
             open_penalty_pips=0.1,      # half a pip per open
-            time_penalty_pips=0.0,     # 0.02 pips per bar in trade
-            unrealized_delta_weight=1.0
+            time_penalty_pips=0.005,     # 0.02 pips per bar in trade
         )
 
     # Test-eval env: deterministic
@@ -140,10 +135,8 @@ def main():
             feature_std=train_std,
             feature_mean=train_mean, 
             feature_columns=feature_cols,
-            hold_reward_weight=0.05,
             open_penalty_pips=0.1,      # half a pip per open
-            time_penalty_pips=0.0,     # 0.02 pips per bar in trade
-            unrealized_delta_weight=1.0
+            time_penalty_pips=0.005,     # 0.02 pips per bar in trade
         )
 
     train_vec_env = SubprocVecEnv([lambda i=i: make_train_env() for i in range(NUM_ENVS)])
@@ -152,31 +145,31 @@ def main():
 
     policy_kwargs = dict(
         net_arch=dict(
-            shared=[128, 128],  # Общие слои помогают критику точнее понимать контекст актера
-            pi=[64], 
-            vf=[64]
-        ),  # ������� ���� �� LSTM
-        lstm_hidden_size=128,                        # ������ ������ LSTM-������
-        n_lstm_layers=1                              # ���������� ����� LSTM
+            shared=[64],
+            pi=[32], 
+            vf=[32]
+        ),
+        lstm_hidden_size=48,
+        n_lstm_layers=1
     )
 
 
     # ---- Model ----
     model = RecurrentPPO(
-        policy="MlpLstmPolicy",       # ����������� �������� � �������
+        policy="MlpLstmPolicy",
         env=train_vec_env,
         verbose=1,
         tensorboard_log="./tensorboard_log/",
-        policy_kwargs=policy_kwargs, # ��������� ����������� ����������� ����
-        ent_coef=0.015,
-        learning_rate=7e-5,       # ����������� ���, ����� ������� �� 1e-4, ���� ������ �������� ����� ������
-        n_steps= 1024,             # ������� ����� �������� ���� ����� ����� ����������� �����
-        batch_size=256,            # ������ ����-����� ��� ������������ ������ (64 ��� 128)
-        n_epochs=10,              # ���������� ���� ����������� �� ���� ���� ������
-        gamma=0.99,               # ����������� ��������������� (0.99 �������� ����� �� ������������ �������)
-        gae_lambda=0.95,          # �������� ��� Generalized Advantage Estimation
-        clip_range=0.1,           # ����������� ��������� �������� (����� ���� �� �������� ������� ��������)
-        vf_coef=0.7               # ��� ������ ������� �������� (Value Function)
+        policy_kwargs=policy_kwargs,
+        ent_coef=0.02,
+        learning_rate=1e-4,
+        n_steps= 1024,
+        batch_size=256,
+        n_epochs=4,
+        gamma=0.99,
+        gae_lambda=0.95,
+        clip_range=0.1,
+        vf_coef=0.5
     )
 
     # ---- Checkpoints ----
@@ -191,7 +184,7 @@ def main():
     )
 
     # ---- Train ----
-    total_timesteps = 1500000
+    total_timesteps = 500000
     model.learn(total_timesteps=total_timesteps, callback=checkpoint_callback)
 
     # ---- Select best model by OOS final equity ----
