@@ -47,7 +47,7 @@ class ForexTradingEnv(gym.Env):
         pip_value: float = 0.0001,
         spread_pips: float = 1.0,              # cost in pips per round-trip (approx)
         commission_pips: float = 0.0,          # cost in pips per round-trip
-        max_slippage_pips: float = 0.2,        # random extra pips (0..max) applied on fills
+        max_slippage_pips: float = 0.5,        # random extra pips (0..max) applied on fills
         lot_size: float = 100000.0,            # 1.0 lot = 100k units (for equity in $)
         reward_scale: float = 0.01,             # optional scaling of rewards
         unrealized_delta_weight: float = 1.0, # shaping weight on delta-unrealized while holding
@@ -57,7 +57,7 @@ class ForexTradingEnv(gym.Env):
         feature_mean: np.ndarray | None = None, # optional normalization (train-fitted)
         feature_std: np.ndarray | None = None,  # optional normalization (train-fitted)
         allow_flip: bool = False,               # if True, OPEN while in position flips (close+open). Default False.
-        hold_reward_weight: float = 0.0,   # tuned below
+        hold_reward_weight: float = 0.05,   # tuned below
         open_penalty_pips: float = 0.1,      # NEW: penalty per open
         time_penalty_pips: float = 0.00,     # NEW: cost per bar in a trade
     ):
@@ -96,7 +96,6 @@ class ForexTradingEnv(gym.Env):
         # Reward handling
         self.reward_scale = float(reward_scale)
         self.unrealized_delta_weight = float(unrealized_delta_weight)
-        self.hold_reward_weight = float(hold_reward_weight)
         self.hold_reward_weight = float(hold_reward_weight)
         self.open_penalty_pips = float(open_penalty_pips)
         self.time_penalty_pips = float(time_penalty_pips)
@@ -184,6 +183,8 @@ class ForexTradingEnv(gym.Env):
     def _compute_unrealized_pips(self):
         if self.position == 0 or self.entry_price is None:
             return 0.0
+        # Так как current_step указывает на текущий развивающийся бар, 
+        # плавающий PnL мы считаем по цене Close этого развивающегося бара
         close_price = float(self.df.loc[self.current_step, "Close"])
         if self.position == 1:
             pnl_price = close_price - self.entry_price
@@ -194,17 +195,19 @@ class ForexTradingEnv(gym.Env):
     def _apply_optional_normalization(self, obs: np.ndarray) -> np.ndarray:
         if self.feature_mean is None or self.feature_std is None:
             return obs
-        mean = self.feature_mean.reshape(1, 1, -1)
-        std = self.feature_std.reshape(1, 1, -1)
+        mean = self.feature_mean.reshape(1, -1)
+        std = self.feature_std.reshape(1, -1)
         std = np.where(std == 0, 1.0, std)
         return (obs - mean) / std
 
     def _get_observation(self):
-        start = self.current_step - self.window_size
+        # Агент должен видеть окно данных, включая бар с индексом self.current_step.
+        # Поскольку iloc не включает верхнюю границу, пишем + 1
+        start = self.current_step - self.window_size + 1
         if start < 0:
             start = 0
 
-        obs_df = self.df.iloc[start:self.current_step].copy()
+        obs_df = self.df.iloc[start:self.current_step+1].copy()
         # use only selected feature columns for the agent
         obs_df = obs_df[self.feature_columns]
 
@@ -218,16 +221,17 @@ class ForexTradingEnv(gym.Env):
                 pad = np.tile(base[0], (pad_rows, 1))
                 base = np.vstack([pad, base])
     
-        # Заполняем весь блок окон состояния агента актуальными данными текущего шага, 
-        # чтобы LSTM видела консистентный статус позиции на протяжении всего окна.
-        state_features = self._get_state_features()
-        state_block = np.tile(state_features, (self.window_size, 1))
-        
-        # Склеиваем историю рынка и очищенный временной блок состояния агента
-        obs = np.hstack([base, state_block]).astype(np.float32)
+        # Применяем нормализацию ТОЛЬКО к рыночным признакам (их размерность совпадает: 8 и 8)
+        base = self._apply_optional_normalization(base)
+        # Создаем пустую матрицу состояний (зануляем историю)
+        state_block = np.zeros((self.window_size, self.state_num_features), dtype=np.float32)
 
-        # Отключаем деструктивную внешнюю нормализацию (ведь всё готово в indicators.py)
-        obs = self._apply_optional_normalization(obs)
+        # Записываем актуальный статус позиции СТРОГО в последнюю (текущую) строку окна.
+        # Это предотвращает дезориентацию LSTM-слоев нейросети.
+        state_block[-1, :] = self._get_state_features()
+
+        # Объединяем признаки рынка и очищенный блок состояния агента
+        obs = np.hstack([base, state_block]).astype(np.float32)
 
         return obs
 
@@ -321,18 +325,17 @@ class ForexTradingEnv(gym.Env):
         if self.position == 0:
             return None
 
-        # If last bar, close on close
-        if self.current_step >= self.n_steps - 2:
-            exit_price = float(self.df.loc[self.current_step, "Close"])
-            net_pips = self._close_position("END_OF_DATA", exit_price)
-            return net_pips
+        # Проверка границ массива (безопасность)
+        if self.current_step >= self.n_steps:
+            return None
 
-        next_high = float(self.df.loc[self.current_step + 1, "High"])
-        next_low = float(self.df.loc[self.current_step + 1, "Low"])
+        # Смотрим текущий High/Low бара, так как действие применилось в конце прошлого шага
+        high = float(self.df.loc[self.current_step, "High"])
+        low = float(self.df.loc[self.current_step, "Low"])
 
         if self.position == 1:
-            sl_hit = next_low <= self.sl_price
-            tp_hit = next_high >= self.tp_price
+            sl_hit = low <= self.sl_price
+            tp_hit = high >= self.tp_price
             if sl_hit and tp_hit:
                 # conservative: SL first
                 return self._close_position("SL_AND_TP_SAME_BAR_SL_FIRST", self.sl_price)
@@ -341,8 +344,8 @@ class ForexTradingEnv(gym.Env):
             elif tp_hit:
                 return self._close_position("TP_HIT", self.tp_price)
         else:
-            sl_hit = next_high >= self.sl_price
-            tp_hit = next_low <= self.tp_price
+            sl_hit = high >= self.sl_price
+            tp_hit = low <= self.tp_price
             if sl_hit and tp_hit:
                 return self._close_position("SL_AND_TP_SAME_BAR_SL_FIRST", self.sl_price)
             elif sl_hit:
@@ -399,15 +402,14 @@ class ForexTradingEnv(gym.Env):
 
         # 1) Обработка действий
         if act_type == "HOLD":
-            pass
-
+            if self.position != 0:
+                reward_pips += self.hold_reward_weight
         elif act_type == "CLOSE":
             if self.position != 0:
                 # Close at current close (with slippage)
                 close_price = float(self.df.loc[self.current_step, "Close"])
                 slip_pips = self._sample_slippage_pips()
-                slip_price = slip_pips * self.pip_value
-                exit_price = close_price - slip_price if self.position == 1 else close_price + slip_price
+                exit_price = close_price - (slip_pips * self.pip_value) if self.position == 1 else close_price + (slip_pips * self.pip_value)
                 reward_pips += self._close_position("MANUAL_CLOSE", exit_price)
 
         elif act_type == "OPEN":
@@ -415,53 +417,47 @@ class ForexTradingEnv(gym.Env):
                 self._open_position(direction=direction, sl_pips=sl_pips, tp_pips=tp_pips)
                 # penalty for opening a trade to discourage overtrading
                 reward_pips -= self.open_penalty_pips
-            else:
-                if self.allow_flip:
-                    close_price = float(self.df.loc[self.current_step, "Close"])
-                    reward_pips += self._close_position("FLIP_CLOSE", close_price)
-                    self._open_position(direction=direction, sl_pips=sl_pips, tp_pips=tp_pips)
-                    reward_pips -= self.open_penalty_pips
+            elif self.allow_flip:
+                 close_price = float(self.df.loc[self.current_step, "Close"])
+                 reward_pips += self._close_position("FLIP_CLOSE", close_price)
+                 self._open_position(direction=direction, sl_pips=sl_pips, tp_pips=tp_pips)
+                 reward_pips -= self.open_penalty_pips
 
-
-        # 2) Проверка внутрибарных SL/TP
+        # 2) Проверка авто-выходов (SL/TP) и удержание ДО сдвига индекса
+        # Так как стопы проверяются по High/Low текущего сформированного часа
+        had_position = (self.position != 0)
         realized_now = self._check_sl_tp_intrabar_and_maybe_close()
         if realized_now is not None:
             reward_pips += realized_now
 
-        # 3) Шейпинг наград для удерживаемой позиции
-        if self.position != 0:
+        if had_position:
             self.time_in_trade += 1
-
-            unreal_now = self._compute_unrealized_pips()
-
-            # Поощряем только ДВИЖЕНИЕ цены в нужную сторону (Delta PnL)
-            delta_unreal = unreal_now - self.prev_unrealized_pips
-            if self.unrealized_delta_weight != 0.0:
-                reward_pips += self.unrealized_delta_weight * delta_unreal
-
-            # Дополнительные кастомные бонусы убраны во избежание бесконечного удержания
             reward_pips -= self.time_penalty_pips
-            self.prev_unrealized_pips = unreal_now
 
+            if self.position != 0:
+                unreal_now = self._compute_unrealized_pips()
+                delta_unreal = unreal_now - self.prev_unrealized_pips
+                if self.unrealized_delta_weight != 0.0:
+                    reward_pips += self.unrealized_delta_weight * delta_unreal
+                self.prev_unrealized_pips = unreal_now
 
-
-        # 4) Инкремент времени среды
+        # 3) Переход к следующему временному шагу
         self.current_step += 1
-
-        # 5) Termination / truncation
-        if self.current_step >= self.n_steps - 1:
+        
+        # 3) Проверка условий завершения эпизода
+        if self.current_step >= self.n_steps-1:
             self.terminated = True
             if self.position != 0: # Форсированное закрытие в конце данных
-                close_price = float(self.df.loc[self.current_step, "Close"])
+                close_price = float(self.df.loc[self.n_steps - 1, "Close"])
                 reward_pips += self._close_position("END_OF_DATA", close_price)
         
         if self.episode_max_steps is not None and self.steps_in_episode >= self.episode_max_steps:
             self.truncated = True
 
-        # 6) Log equity
+        # 5) Log equity
         self.equity_curve.append(float(self.equity_usd))
 
-        # 7) Build observation
+        # 6) Build observation
         obs = self._get_observation()
 
         # Применение скейлинга к итоговому Reward

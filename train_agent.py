@@ -2,6 +2,7 @@
 import os
 import numpy as np
 import matplotlib.pyplot as plt
+import pandas as pd
 
 from sb3_contrib import RecurrentPPO
 from stable_baselines3.common.vec_env import DummyVecEnv, SubprocVecEnv
@@ -16,14 +17,11 @@ def evaluate_model(model: RecurrentPPO, eval_env: DummyVecEnv, deterministic: bo
     model.set_env(eval_env, force_reset=False)
     obs = eval_env.reset()
     equity_curve = []
-    # �������������� ������� ��������� ������ LSTM ������ (����� ������ �� ������ �� ������)
+
     lstm_states = None
-    # ����� ������ ������� (True ��������, ��� ��� ������ ���)
     episode_starts = np.ones((eval_env.num_envs,), dtype=bool)
 
     while True:
-
-        # �������� � predict ��������� ������ � ����� ������
         action, lstm_states = model.predict(
             obs, 
             state=lstm_states, 
@@ -31,26 +29,28 @@ def evaluate_model(model: RecurrentPPO, eval_env: DummyVecEnv, deterministic: bo
             deterministic=deterministic
         )
 
-        step_out = eval_env.step(action)
+        obs, rewards, dones, infos = eval_env.step(action)
+        done = bool(dones[0])
 
-        if len(step_out) == 4:
-            obs, rewards, dones, infos = step_out
-            done = bool(dones[0])
-        else:
-            obs, rewards, terminated, truncated, infos = step_out
-            done = bool(terminated[0] or truncated[0])
+        # Передаем реальный статус завершения на следующий шаг для LSTM
+        episode_starts = dones
 
-        # ����� ������� ���� ����� ��� ��������� ������ ������� (����� ���������� False)
-        episode_starts = np.zeros((eval_env.num_envs,), dtype=bool)
-
-        info = infos[0] if isinstance(infos, (list, tuple)) else infos
-        eq = info.get("equity_usd", eval_env.get_attr("equity_usd")[0])
-        if isinstance(eq, (list, np.ndarray)):
-           eq = eq[0]
-        equity_curve.append(float(eq))
+        # Извлекаем словарь info для единственной среды в векторе
+        info = infos[0]
 
         if done:
-            break
+            # Если это последний шаг, вытаскиваем финальное эквити из словаря info
+            if isinstance(info, dict) and "equity_usd" in info:
+                equity_curve.append(float(info["equity_usd"]))
+            elif isinstance(info, dict) and "terminal_observation" in info and "equity_usd" in info["terminal_observation"]:
+                equity_curve.append(float(info["terminal_observation"]["equity_usd"]))
+            else:
+                if equity_curve:
+                    equity_curve.append(equity_curve[-1])
+            break # Мгновенно выходим из цикла
+        else:
+            # Если эпизод продолжается, берем текущее эквити из ЖИВОЙ среды eval_env
+            equity_curve.append(float(eval_env.get_attr("equity_usd")[0]))
 
     final_equity = float(equity_curve[-1])
     return equity_curve, final_equity
@@ -62,7 +62,6 @@ def main():
     file_path = "data/test_EURUSD_Candlestick_1_Hour_BID_20.02.2023-22.02.2025.csv"
     df, feature_cols = load_and_preprocess_data(file_path)
 
-    # Time split 80/20
     split_idx = int(len(df) * 0.8)
     train_df = df.iloc[:split_idx].copy()
     test_df = df.iloc[split_idx:].copy()
@@ -70,11 +69,19 @@ def main():
     print("Training bars:", len(train_df))
     print("Testing bars :", len(test_df))
 
+    # Извлекаем признаки для расчета параметров нормализации (БЕЗ учета таргетов/цен, если нужно)
+    # Считаем среднее и дисперсию СТРОГО на обучающей выборке (Защита от Data Leakage)
+    train_features_df = train_df[feature_cols].apply(pd.to_numeric, errors='coerce').fillna(0.0)
+    train_features = train_features_df.values.astype(np.float32)
+    train_mean = np.mean(train_features, axis=0)
+    train_std = np.std(train_features, axis=0)
+
     # ---- Env factories ----
     SL_OPTS = [30, 90]
     TP_OPTS = [30,90]
     WIN = 60
     NUM_ENVS = 4  # Задействуем 4 параллельных потока (FPS вырастет до 160-200+)
+    
     # Train env: random starts to reduce memorization
     def make_train_env():
         return ForexTradingEnv(
@@ -84,12 +91,14 @@ def main():
             tp_options=TP_OPTS,
             spread_pips=1.0,
             commission_pips=0.0,
-            max_slippage_pips=0.2,
+            max_slippage_pips=0.5,
             random_start=True,
             min_episode_steps=1000,
             episode_max_steps=None,
+            feature_mean=train_mean, 
+            feature_std=train_std,    
             feature_columns=feature_cols,
-            hold_reward_weight=0.0,#0.05
+            hold_reward_weight=0.05,#0.05
             open_penalty_pips=0.1,      # 0.5 half a pip per open
             time_penalty_pips=0.0,     # 0.02 pips per bar in trade
             unrealized_delta_weight=1.0
@@ -104,11 +113,13 @@ def main():
             tp_options=TP_OPTS,
             spread_pips=1.0,
             commission_pips=0.0,
-            max_slippage_pips=0.2,
+            max_slippage_pips=0.5,
             random_start=False,
             episode_max_steps=None,
+            feature_mean=train_mean,
+            feature_std=train_std,
             feature_columns=feature_cols,
-            hold_reward_weight=0.00,
+            hold_reward_weight=0.05,
             open_penalty_pips=0.1,      # half a pip per open
             time_penalty_pips=0.0,     # 0.02 pips per bar in trade
             unrealized_delta_weight=1.0
@@ -123,11 +134,13 @@ def main():
             tp_options=TP_OPTS,
             spread_pips=1.0,
             commission_pips=0.0,
-            max_slippage_pips=0.2,
+            max_slippage_pips=0.5,
             random_start=False,
             episode_max_steps=None,
+            feature_std=train_std,
+            feature_mean=train_mean, 
             feature_columns=feature_cols,
-            hold_reward_weight=0.00,
+            hold_reward_weight=0.05,
             open_penalty_pips=0.1,      # half a pip per open
             time_penalty_pips=0.0,     # 0.02 pips per bar in trade
             unrealized_delta_weight=1.0
@@ -182,49 +195,14 @@ def main():
     model.learn(total_timesteps=total_timesteps, callback=checkpoint_callback)
 
     # ---- Select best model by OOS final equity ----
-    _, final_equity_train_last = evaluate_model(model, train_eval_env)
-    print(f"[IS Eval] Last model final equity: {final_equity_train_last:.2f}")
-
-    best_train_equity = final_equity_train_last
-    best_path = None
-    best_model = model
-
-    ckpts = sorted(
-        [f for f in os.listdir(ckpt_dir) if f.endswith(".zip") and f.startswith(CKPT_PREFIX)],
-        key=lambda x: os.path.getmtime(os.path.join(ckpt_dir, x))
-    )
-
-    for ck in ckpts:
-        ck_path = os.path.join(ckpt_dir, ck)
-        try:
-            # ��������� ��������
-            m = RecurrentPPO.load(ck_path, env=None)
-            # ��������� ��� ������ �� TRAIN-EVAL (In-Sample)
-            _, final_eq_train = evaluate_model(m, train_eval_env)
-            print(f"[IS Eval] {ck} -> train equity: {final_eq_train:.2f}")
-            
-            if final_eq_train > best_train_equity:
-                best_train_equity = final_eq_train
-                best_path = ck_path
-                best_model = m
-        except Exception as e:
-            print(f"[Skip] Could not evaluate checkpoint {ck}: {e}")
-
-    # Decide best model
-    if best_path is not None:
-        print(f"Using best checkpoint by Train PnL: {best_path} (Train equity: {best_train_equity:.2f})")
-    else:
-        print("Using last model as best (no checkpoint beat it on Train data).")
-    
-    best_model.set_env(train_vec_env, force_reset=False)
-    best_model.save("model_eurusd_best")
-    print("Best model saved: model_eurusd_best")
+    model.save("model_eurusd_best")
+    print("Model saved: model_eurusd_best")
 
     # ---- Plot BOTH: in-sample vs out-of-sample ----
-    plot_model_train = RecurrentPPO.load("model_eurusd_best", env=None)
+    plot_model_train = RecurrentPPO.load("model_eurusd_best", env=train_eval_env)
     equity_curve_train, final_equity_train = evaluate_model(plot_model_train, train_eval_env)
     
-    plot_model_test = RecurrentPPO.load("model_eurusd_best", env=None)
+    plot_model_test = RecurrentPPO.load("model_eurusd_best", env=test_eval_env)
     equity_curve_test, final_equity_test = evaluate_model(plot_model_test, test_eval_env)
 
 
@@ -232,14 +210,25 @@ def main():
     print(f"[OOS Eval] Final equity (test) : {final_equity_test:.2f}")
 
     plt.figure(figsize=(12, 6))
-    plt.plot(equity_curve_train, label="Train (in-sample) equity")
-    plt.plot(equity_curve_test, label="Test (out-of-sample) equity")
-    plt.title("Equity Curves: In-sample vs Out-of-sample (Best Model)")
+    plt.plot(equity_curve_train, label=f"Train (in-sample) equity: {final_equity_train:.2f}$")
+    plt.title("Train (In-Sample) Equity Curve - Best Model")
     plt.xlabel("Steps")
     plt.ylabel("Equity ($)")
     plt.legend()
+    plt.grid(True, alpha=0.3)
     plt.tight_layout()
-    plt.savefig("model1")
+    plt.savefig("model1_train_clean.png")
+
+    plt.figure(figsize=(12, 6))
+    plt.plot(equity_curve_test, label=f"Test (out-of-sample) equity: {final_equity_test:.2f}$", color="orange")
+    plt.title("Test (Out-of-Sample) Equity Curve - Best Model")
+    plt.xlabel("Steps")
+    plt.ylabel("Equity ($)")
+    plt.legend()
+    plt.grid(True, alpha=0.3)
+    plt.tight_layout()
+    plt.savefig("model1_test_clean.png")
+
 
 
 if __name__ == "__main__":
