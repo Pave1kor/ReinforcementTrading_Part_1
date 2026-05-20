@@ -112,7 +112,7 @@ def load_and_preprocess_data(csv_path: str):
     df.dropna(inplace=True)
 
     # Columns the AGENT should see 
-     feature_cols = [
+    feature_cols = [
         "alma_atr",
         "relative_volume",
         "price_dist_from_avg",

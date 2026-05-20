@@ -5,7 +5,7 @@ from sb3_contrib import RecurrentPPO
 from stable_baselines3.common.vec_env import DummyVecEnv
 from indicators import load_and_preprocess_data
 from trading_env import ForexTradingEnv
-from train_agent import evaluate_model, calculate_metrics   # переиспользуем функции
+from train_agent import evaluate_model, calculate_metrics
 
 def main():
     file_path = "data/EURUSD_Candlestick_1_Hour_BID_01.07.2020-15.07.2023.csv"
@@ -37,9 +37,13 @@ def main():
             feature_columns=feature_cols,
             feature_mean=train_mean,
             feature_std=train_std,
-            open_penalty_pips=0.1,
-            time_penalty_pips=0.005,
-            unrealized_reward_coef=0.1
+            open_penalty_pips=2.0,
+            time_penalty_pips=0.1,
+            unrealized_reward_coef=0.05,
+            max_drawdown_pct=0.25,
+            risk_adjusted_scale=1.0,
+            trade_penalty_pips=2.0,
+            reward_scale=0.01
         )
 
     test_env = DummyVecEnv([make_test_env])

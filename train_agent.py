@@ -15,20 +15,15 @@ def calculate_metrics(equity_curve: list, trades: list, initial_capital: float =
     if len(equity) < 2:
         return {}
     returns = np.diff(equity) / equity[:-1]
-    # Sharpe (годовой, безрисковая 0)
     sharpe = np.sqrt(252 * 24) * np.mean(returns) / np.std(returns) if np.std(returns) > 0 else 0.0
-    # Sortino (только отрицательные отклонения)
     neg_returns = returns[returns < 0]
     sortino = np.sqrt(252 * 24) * np.mean(returns) / np.std(neg_returns) if len(neg_returns) > 0 and np.std(neg_returns) > 0 else 0.0
-    # Max Drawdown
     peak = np.maximum.accumulate(equity)
     drawdown = (peak - equity) / peak
     max_dd = np.max(drawdown)
-    # Calmar (annual return / maxDD)
     total_return = (equity[-1] - initial_capital) / initial_capital
     annual_return = (1 + total_return) ** (252 * 24 / len(equity)) - 1 if len(equity) > 0 else 0
     calmar = annual_return / max_dd if max_dd > 0 else np.inf
-    # Торговые метрики
     if trades:
         trades_df = pd.DataFrame(trades)
         net_pips = trades_df["net_pips"].values
@@ -41,7 +36,6 @@ def calculate_metrics(equity_curve: list, trades: list, initial_capital: float =
         win_rate = 0.0
         avg_trade = 0.0
         total_trades = 0
-
     return {
         "sharpe_ratio": sharpe,
         "sortino_ratio": sortino,
@@ -92,7 +86,7 @@ def main():
     file_path = "data/EURUSD_Candlestick_1_Hour_BID_01.07.2020-15.07.2023.csv"
     df, feature_cols = load_and_preprocess_data(file_path)
 
-    # Разбиение (простое 80/20 – для walk‑forward нужна циклическая логика, здесь для краткости оставляем простое)
+    # Разбиение (простое 80/20)
     split_idx = int(len(df) * 0.8)
     train_df = df.iloc[:split_idx].copy()
     test_df = df.iloc[split_idx:].copy()
@@ -123,14 +117,18 @@ def main():
             feature_mean=train_mean,
             feature_std=train_std,
             feature_columns=feature_cols,
-            open_penalty_pips=0.1,
-            time_penalty_pips=0.005,
-            unrealized_reward_coef=0.1
+            open_penalty_pips=2.0,
+            time_penalty_pips=0.1,
+            unrealized_reward_coef=0.05,
+            max_drawdown_pct=0.25,
+            risk_adjusted_scale=1.0,
+            trade_penalty_pips=2.0,
+            reward_scale=0.01
         )
 
     def make_eval_env():
         return ForexTradingEnv(
-            df=train_df,   # валидация на том же train, но без random_start
+            df=train_df,
             window_size=WIN,
             sl_options=SL_OPTS,
             tp_options=TP_OPTS,
@@ -142,9 +140,13 @@ def main():
             feature_mean=train_mean,
             feature_std=train_std,
             feature_columns=feature_cols,
-            open_penalty_pips=0.1,
-            time_penalty_pips=0.005,
-            unrealized_reward_coef=0.1
+            open_penalty_pips=2.0,
+            time_penalty_pips=0.1,
+            unrealized_reward_coef=0.05,
+            max_drawdown_pct=0.25,
+            risk_adjusted_scale=1.0,
+            trade_penalty_pips=2.0,
+            reward_scale=0.01
         )
 
     def make_test_env():
@@ -161,19 +163,23 @@ def main():
             feature_mean=train_mean,
             feature_std=train_std,
             feature_columns=feature_cols,
-            open_penalty_pips=0.1,
-            time_penalty_pips=0.005,
-            unrealized_reward_coef=0.1
+            open_penalty_pips=2.0,
+            time_penalty_pips=0.1,
+            unrealized_reward_coef=0.05,
+            max_drawdown_pct=0.25,
+            risk_adjusted_scale=1.0,
+            trade_penalty_pips=2.0,
+            reward_scale=0.01
         )
 
     train_vec_env = SubprocVecEnv([lambda i=i: make_train_env() for i in range(NUM_ENVS)])
-    eval_env = DummyVecEnv([make_eval_env])
+    eval_env = SubprocVecEnv([make_eval_env])
 
-    # Политика LSTM
+    # Увеличенная LSTM сеть
     policy_kwargs = dict(
-        net_arch=dict(shared=[64], pi=[32], vf=[32]),
-        lstm_hidden_size=48,
-        n_lstm_layers=1
+        net_arch=dict(shared=[128], pi=[64], vf=[64]),
+        lstm_hidden_size=96,
+        n_lstm_layers=2
     )
 
     model = RecurrentPPO(
@@ -182,14 +188,14 @@ def main():
         verbose=1,
         tensorboard_log="./tensorboard_log/",
         policy_kwargs=policy_kwargs,
-        ent_coef=0.02,
+        ent_coef=0.01,          # уменьшен для снижения случайности
         learning_rate=1e-4,
         n_steps=1024,
         batch_size=256,
         n_epochs=4,
         gamma=0.99,
         gae_lambda=0.95,
-        clip_range=0.1,
+        clip_range=0.05,        # более консервативное обновление
         vf_coef=0.5
     )
 
@@ -201,16 +207,14 @@ def main():
 
     # Финальное тестирование на OOS
     best_model = RecurrentPPO.load("./best_model/best_model.zip")
-    test_env = DummyVecEnv([make_test_env])
+    test_env = SubprocVecEnv([make_test_env])
     equity_test, trades_test = evaluate_model(best_model, test_env, deterministic=True)
 
-    # Расчёт метрик
     metrics = calculate_metrics(equity_test, trades_test)
     print("\n========== METRICS ON TEST SET ==========")
     for k, v in metrics.items():
         print(f"{k}: {v:.4f}" if isinstance(v, float) else f"{k}: {v}")
 
-    # Сохраняем график и сделки
     plt.figure(figsize=(12,6))
     plt.plot(equity_test, label=f"Test Equity Final: {equity_test[-1]:.2f}")
     plt.title("Out-of-Sample Equity Curve")
