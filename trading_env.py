@@ -1,6 +1,5 @@
 from __future__ import annotations
 import numpy as np
-import pandas as pd
 try:
     import gymnasium as gym
     from gymnasium import spaces
@@ -12,8 +11,10 @@ except ImportError:
 
 class ForexTradingEnv(gym.Env):
     """
-    Торговая среда с корректным учётом нереализованной прибыли,
-    динамическим трейлинг-стопом и функцией награды на основе изменения полной эквити.
+    Торговая среда для EUR/USD с динамическими SL/TP,
+    корректным учётом нереализованной прибыли и shaping-наградой на основе slope_div.
+    ИСПРАВЛЕНА ВРЕМЕННАЯ ЛОГИКА: каждый шаг соответствует одному закрытому бару,
+    исполнение сделок происходит на следующем баре.
     """
     metadata = {"render_modes": ["human"]}
 
@@ -27,26 +28,28 @@ class ForexTradingEnv(gym.Env):
         commission_pips: float = 0.0,
         max_slippage_pips: float = 0.5,
         lot_size: float = 100000.0,
-        risk_per_trade: float = 0.005,          # уменьшено с 0.007
+        risk_per_trade: float = 0.002,          # уменьшено с 0.005
         leverage: float = 50.0,
-        reward_scale: float = 1.0,              # масштаб награды (не критичен)
+        reward_scale: float = 0.0001,
         random_start: bool = True,
         min_episode_steps: int = 300,
         episode_max_steps: int | None = None,
         feature_mean: np.ndarray | None = None,
         feature_std: np.ndarray | None = None,
-        # Параметры SL/TP (увеличены)
-        base_sl_pips: float = 45.0,
-        base_tp_pips: float = 90.0,
+        # Параметры SL/TP
+        base_sl_pips: float = 30.0,             # уменьшено с 45
+        base_tp_pips: float = 60.0,             # уменьшено с 90
         k_sl: float = 0.3,
         k_tp: float = 0.6,
-        # Штрафы (оставлены, но награда теперь от изменения эквити)
-        open_penalty_pips: float = 0.5,
-        time_penalty_pips: float = 0.001,
-        # Динамический трейлинг (множитель ATR)
+        # Штрафы
+        open_penalty_pips: float = 0.0,         # убран штраф
+        time_penalty_pips: float = 0.0005,      # уменьшен
+        # Трейлинг и фильтры
         trailing_atr_mult: float = 2.0,
-        # Фильтр открытия: минимальный ATR в пипсах
         min_atr_pips: float = 10.0,
+        # Shaping и бонусы
+        slope_div_reward_scale: float = 0.01,
+        open_bonus_pips: float = 5.0,
     ):
         super().__init__()
         self.df = df.reset_index(drop=True)
@@ -66,6 +69,8 @@ class ForexTradingEnv(gym.Env):
         self.time_penalty_pips = float(time_penalty_pips)
         self.trailing_atr_mult = float(trailing_atr_mult)
         self.min_atr_pips = float(min_atr_pips)
+        self.slope_div_reward_scale = float(slope_div_reward_scale)
+        self.open_bonus_pips = float(open_bonus_pips)
         self.random_start = bool(random_start)
         self.min_episode_steps = int(min_episode_steps)
         self.episode_max_steps = episode_max_steps if episode_max_steps is None else int(episode_max_steps)
@@ -77,10 +82,10 @@ class ForexTradingEnv(gym.Env):
         self.k_sl = k_sl
         self.k_tp = k_tp
 
-        self.action_space = spaces.Discrete(4)  # 0:HOLD,1:OPEN_LONG,2:OPEN_SHORT,3:CLOSE
+        self.action_space = spaces.Discrete(4)  # 0:HOLD, 1:OPEN_LONG, 2:OPEN_SHORT, 3:CLOSE
 
         self.base_num_features = len(self.feature_columns)
-        self.state_num_features = 5   # позиция, время в сделке, unrealized норм., флаг flat, entry_slope
+        self.state_num_features = 5
         self.num_features = self.base_num_features + self.state_num_features
         self.observation_space = spaces.Box(
             low=-np.inf, high=np.inf,
@@ -90,42 +95,46 @@ class ForexTradingEnv(gym.Env):
         self._reset_state()
 
     def _reset_state(self):
-        self.current_step = 0
+        self.current_idx = 0          # индекс текущего закрытого бара (для наблюдения)
+        self.next_idx = 1             # индекс следующего бара (для исполнения)
         self.steps_in_episode = 0
         self.terminated = False
         self.truncated = False
-        self.position = 0          # 1 long, -1 short
+        self.position = 0
         self.entry_price = None
         self.sl_price = None
         self.tp_price = None
         self.time_in_trade = 0
         self.entry_slope = 0.0
         self.initial_equity_usd = 10000.0
-        self.equity_usd = self.initial_equity_usd   # только закрытый PnL
+        self.equity_usd = self.initial_equity_usd
         self.last_trade_info = None
         self.usd_per_pip = self.pip_value * self.lot_size
         self.pending_close_reason = None
-        # Для расчёта награды: запомним полную эквити на прошлом шаге
-        self.prev_full_equity = self._get_current_equity()
 
-    def _get_current_equity(self) -> float:
-        """Возвращает текущую эквити (капитал + нереализованная прибыль/убыток)."""
-        unrealized_usd = 0.0
-        if self.position != 0 and self.entry_price is not None:
-            close = float(self.df.loc[self.current_step, "Close"])
-            if self.position == 1:
-                unrealized_pips = (close - self.entry_price) / self.pip_value
-            else:
-                unrealized_pips = (self.entry_price - close) / self.pip_value
-            unrealized_usd = unrealized_pips * self.usd_per_pip
+    # ---------- Вспомогательные методы для эквити ----------
+    def _get_equity_at_price(self, price: float) -> float:
+        """Полная эквити (закрытый PnL + переоценка открытой позиции по заданной цене)."""
+        if self.position == 0 or self.entry_price is None:
+            return self.equity_usd
+        if self.position == 1:
+            unrealized_pips = (price - self.entry_price) / self.pip_value
+        else:
+            unrealized_pips = (self.entry_price - price) / self.pip_value
+        unrealized_usd = unrealized_pips * self.usd_per_pip
         return self.equity_usd + unrealized_usd
 
+    def _get_current_equity(self) -> float:
+        """Текущая полная эквити (по цене Close текущего бара)."""
+        current_close = self.df.loc[self.current_idx, "Close"]
+        return self._get_equity_at_price(current_close)
+
     def _get_state_features(self):
-        """Состояние агента – использует нереализованную прибыль на момент конца бара."""
+        """Состояние агента (нормированные показатели)."""
         pos = float(self.position)
         t_norm = float(self.time_in_trade) / 100.0
         if self.position != 0:
-            close = float(self.df.loc[self.current_step, "Close"])
+            close = float(self.df.loc[self.current_idx, "Close"])
             if self.position == 1:
                 unreal_pips = (close - self.entry_price) / self.pip_value
             else:
@@ -140,21 +149,20 @@ class ForexTradingEnv(gym.Env):
     def _apply_normalization(self, obs):
         if self.feature_mean is None or self.feature_std is None:
             return obs
-        mean = self.feature_mean.reshape(1, -1)
-        std = self.feature_std.reshape(1, -1)
-        std = np.where(std == 0, 1.0, std)
-        return (obs - mean) / std
+        # защита от NaN в std
+        std = np.where(self.feature_std == 0, 1.0, self.feature_std)
+        std = np.nan_to_num(std, nan=1.0)
+        obs = (obs - self.feature_mean) / std
+        obs = np.nan_to_num(obs, nan=0.0)
+        return obs
 
     def _get_observation(self):
-        start = max(0, self.current_step - self.window_size)
-        indices = list(range(start, self.current_step))
-        if not indices:
-            indices = [0] * self.window_size
+        start = max(0, self.current_idx - self.window_size + 1)
+        indices = list(range(start, self.current_idx + 1))
+        if len(indices) < self.window_size:
+            pad = self.window_size - len(indices)
+            indices = [0] * pad + indices
         obs_df = self.df.iloc[indices]
-        if len(obs_df) < self.window_size:
-            pad = self.window_size - len(obs_df)
-            pad_df = pd.DataFrame(0, index=range(pad), columns=obs_df.columns)
-            obs_df = pd.concat([pad_df, obs_df])
         base = obs_df[self.feature_columns].values.astype(np.float32)
         base = self._apply_normalization(base)
 
@@ -163,6 +171,7 @@ class ForexTradingEnv(gym.Env):
         obs = np.hstack([base, state_block]).astype(np.float32)
         return obs
 
+    # ---------- Торговые вспомогательные методы ----------
     def _sample_slippage_pips(self):
         if self.max_slippage_pips <= 0:
             return 0.0
@@ -181,7 +190,7 @@ class ForexTradingEnv(gym.Env):
         tp_mult = 1 + self.k_tp * abs_slope
         sl_pips = base_sl * sl_mult * vol_factor
         tp_pips = base_tp * tp_mult * vol_factor
-        sl_pips = np.clip(sl_pips, 10.0, 100.0)   # чуть шире
+        sl_pips = np.clip(sl_pips, 10.0, 100.0)
         tp_pips = max(tp_pips, sl_pips * 1.2)
         return sl_pips, tp_pips
 
@@ -189,26 +198,23 @@ class ForexTradingEnv(gym.Env):
         required_margin = (lot_size * entry_price) / self.leverage
         return self._get_current_equity() > required_margin * 1.05
 
-    def _open_position(self, direction: int, step_index: int):
+    def _open_position(self, direction: int, bar):
+        """
+        Открытие позиции на основе данных следующего бара (bar).
+        bar – pd.Series с полями Open, High, Low, Close, alma_atr, slope_div и т.д.
+        """
         if self.position != 0:
             return False
 
-        close_price = float(self.df.loc[step_index, "Close"])
-        if step_index + 1 < len(self.df):
-            entry_base_price = float(self.df.loc[step_index + 1, "Open"])
-        else:
-            return False
-
-        current_atr = float(self.df.loc[step_index, "alma_atr"]) / self.pip_value
+        entry_base_price = float(bar["Open"])
+        current_atr = float(bar["alma_atr"]) / self.pip_value
         if current_atr <= 1e-6:
             current_atr = 15.0
 
-        # Фильтр по ATR: не открываться в штиль
         if current_atr < self.min_atr_pips:
             return False
 
-        slope_val = float(self.df.loc[step_index, "slope_div"])
-
+        slope_val = float(bar["slope_div"])
         sl_pips, tp_pips = self._compute_sl_tp(direction, slope_val, current_atr)
 
         if self.risk_per_trade > 0:
@@ -220,6 +226,9 @@ class ForexTradingEnv(gym.Env):
             lot_size = max(lot_size, 1000.0)
         else:
             lot_size = self.lot_size
+
+        if lot_size <= 0:
+            return False
         self.usd_per_pip = self.pip_value * lot_size
 
         if not self._check_margin(lot_size, entry_base_price):
@@ -230,11 +239,18 @@ class ForexTradingEnv(gym.Env):
 
         if direction == 1:  # long
             entry = entry_base_price + slip_price
+            # Ограничиваем цену входа диапазоном High/Low бара (реалистичность)
+            high = float(bar["High"])
+            low = float(bar["Low"])
+            entry = np.clip(entry, low, high)
             sl_price = entry - sl_pips * self.pip_value
             tp_price = entry + tp_pips * self.pip_value
             self.position = 1
         else:               # short
             entry = entry_base_price - slip_price
+            high = float(bar["High"])
+            low = float(bar["Low"])
+            entry = np.clip(entry, low, high)
             sl_price = entry + sl_pips * self.pip_value
             tp_price = entry - tp_pips * self.pip_value
             self.position = -1
@@ -246,7 +262,7 @@ class ForexTradingEnv(gym.Env):
         self.entry_slope = slope_val
         self.last_trade_info = {
             "event": "OPEN",
-            "step": self.current_step,
+            "step": self.current_idx,
             "position": self.position,
             "entry_price": self.entry_price,
             "sl_price": self.sl_price,
@@ -255,6 +271,13 @@ class ForexTradingEnv(gym.Env):
             "atr_pips": current_atr,
             "lot_size": lot_size
         }
+        # Применяем штраф за открытие (если есть)
+        penalty_usd = self.open_penalty_pips * self.usd_per_pip
+        if penalty_usd > 0:
+            self.equity_usd -= penalty_usd
+        # Бонус при отрицательном slope_div
+        if self.open_bonus_pips > 0 and slope_val < 0:
+            self.equity_usd += self.open_bonus_pips * self.usd_per_pip
         return True
 
     def _close_position(self, reason: str, exit_price: float):
@@ -269,7 +292,7 @@ class ForexTradingEnv(gym.Env):
         trade_info = {
             "event": "CLOSE",
             "reason": reason,
-            "step": self.current_step,
+            "step": self.current_idx,
             "position": self.position,
             "entry_price": self.entry_price,
             "exit_price": exit_price,
@@ -288,72 +311,74 @@ class ForexTradingEnv(gym.Env):
         self.last_trade_info = trade_info
         return net_pips
 
-    def _check_sl_tp_intrabar(self):
-        """Проверка SL/TP и динамический трейлинг-стоп на основе ATR."""
+    def _check_sl_tp_intrabar(self, bar):
+        """
+        Проверка срабатывания стоп-лосса или тейк-профита на баре (High/Low).
+        Возвращает net_pips, если позиция закрыта, иначе None.
+        """
         if self.position == 0:
             return None
-        high = float(self.df.loc[self.current_step, "High"])
-        low = float(self.df.loc[self.current_step, "Low"])
-        current_atr = float(self.df.loc[self.current_step, "alma_atr"]) / self.pip_value
+        high = float(bar["High"])
+        low = float(bar["Low"])
+        current_atr = float(bar["alma_atr"]) / self.pip_value
         trailing_trigger = current_atr * self.trailing_atr_mult
 
         if self.position == 1:
-            # Трейлинг: подтягиваем SL к уровню Entry, если цена прошла trailing_trigger пипсов
+            # трейлинг стоп (перемещаем SL в безубыток при проходе цены)
             if high >= self.entry_price + trailing_trigger * self.pip_value:
                 new_sl = self.entry_price
                 if new_sl > self.sl_price:
                     self.sl_price = new_sl
-            if low <= self.sl_price:
-                return self._close_position("SL_HIT", self.sl_price)
+            # сначала проверяем TP, потом SL (по логике внутрибарового исполнения)
             if high >= self.tp_price:
                 return self._close_position("TP_HIT", self.tp_price)
-        else:
+            if low <= self.sl_price:
+                return self._close_position("SL_HIT", self.sl_price)
+        else:  # short
             if low <= self.entry_price - trailing_trigger * self.pip_value:
                 new_sl = self.entry_price
                 if new_sl < self.sl_price:
                     self.sl_price = new_sl
-            if high >= self.sl_price:
-                return self._close_position("SL_HIT", self.sl_price)
             if low <= self.tp_price:
                 return self._close_position("TP_HIT", self.tp_price)
+            if high >= self.sl_price:
+                return self._close_position("SL_HIT", self.sl_price)
         return None
 
-    def _get_auto_close_signal(self):
-        """Сигнал на закрытие по дивергенции (ужесточён порог)."""
+    def _get_auto_close_signal(self, bar):
+        """
+        Сигнал автоматического закрытия по дивергенции на основе текущего бара.
+        """
         if self.position == 0:
             return None
-        prev_idx = self.current_step - 1
-        if prev_idx < 0:
-            return None
-        prev_bull = self.df.loc[prev_idx, "bull_div"] == 1
-        prev_bear = self.df.loc[prev_idx, "bear_div"] == 1
-        prev_slope_div = self.df.loc[prev_idx, "slope_div"]
-        # Порог увеличен с 0.1 до 0.3
-        if self.position == 1 and prev_bear and prev_slope_div < -0.3:
+        bull = bar["bull_div"] == 1
+        bear = bar["bear_div"] == 1
+        slope_div = bar["slope_div"]
+        if self.position == 1 and bear and slope_div < -0.3:
             return "BEAR_DIV"
-        if self.position == -1 and prev_bull and prev_slope_div < -0.3:
+        if self.position == -1 and bull and slope_div < -0.3:
             return "BULL_DIV"
         return None
-    def _get_equity_at_price(self, price: float) -> float:
-        if self.position == 0 or self.entry_price is None:
-            return self.equity_usd
-        if self.position == 1:
-            unrealized_pips = (price - self.entry_price) / self.pip_value
-        else:
-            unrealized_pips = (self.entry_price - price) / self.pip_value
-        unrealized_usd = unrealized_pips * self.usd_per_pip
-        return self.equity_usd + unrealized_usd
 
+    # ---------- Основные методы gym ----------
     def reset(self, seed=None, options=None):
         super().reset(seed=seed)
         self._reset_state()
         if self.random_start:
             max_start = self.n_steps - max(self.min_episode_steps, self.window_size) - 2
-            self.current_step = np.random.randint(self.window_size, max(self.window_size + 1, max_start))
+            start = np.random.randint(self.window_size, max(self.window_size + 1, max_start))
+            self.current_idx = start
+            self.next_idx = start + 1
         else:
-            self.current_step = self.window_size
+            self.current_idx = self.window_size
+            self.next_idx = self.window_size + 1
+
+        # Убедимся, что next_idx не выходит за границы
+        if self.next_idx >= self.n_steps:
+            self.next_idx = self.n_steps - 1
+            self.current_idx = self.next_idx - 1
+
         self.steps_in_episode = 0
-        self.prev_full_equity = self._get_current_equity()   # инициализация
         obs = self._get_observation()
         if _GYMNASIUM:
             return obs, {}
@@ -368,77 +393,89 @@ class ForexTradingEnv(gym.Env):
 
         self.steps_in_episode += 1
 
-        # --- Эквити на начало шага (по цене закрытия предыдущего бара) ---
-        prev_idx = max(0, self.current_step - 1)
-        prev_close = self.df.loc[prev_idx, "Close"]
-        equity_start = self._get_equity_at_price(prev_close)
+        # Данные текущего бара (для наблюдения) и следующего (для исполнения)
+        curr_bar = self.df.iloc[self.current_idx]
+        next_bar = self.df.iloc[self.next_idx] if self.next_idx < self.n_steps else None
 
-        # --- Обработка отложенного закрытия по дивергенции (по Open текущего бара) ---
+        if next_bar is None:
+            # Данные закончились – принудительное завершение
+            self.terminated = True
+            if self.position != 0:
+                last_close = curr_bar["Close"]
+                self._close_position("END_OF_DATA", last_close)
+            obs = self._get_observation()
+            info = {"equity_usd": self._get_current_equity()}
+            if _GYMNASIUM:
+                return obs, 0.0, True, False, info
+            return obs, 0.0, True, info
+
+        # Эквити на начало шага (по Close текущего бара)
+        equity_start = self._get_equity_at_price(curr_bar["Close"])
+
+        # --- Обработка отложенного закрытия по дивергенции ---
         if self.pending_close_reason is not None:
-            close_price = float(self.df.loc[self.current_step, "Open"])
-            _ = self._close_position(self.pending_close_reason, close_price)
+            self._close_position(self.pending_close_reason, next_bar["Open"])
             self.pending_close_reason = None
 
         # --- Действие агента ---
         if action == 1:   # OPEN_LONG
             if self.position == 0:
-                has_signal = (self.df.loc[self.current_step-1, "bull_div"] == 1)
-                if self._open_position(1, self.current_step - 1):
-                    penalty_pips = self.open_penalty_pips
-                    if not has_signal:
-                        penalty_pips += 0.3
-                    self.equity_usd -= penalty_pips * self.usd_per_pip
+                self._open_position(1, next_bar)
         elif action == 2: # OPEN_SHORT
             if self.position == 0:
-                has_signal = (self.df.loc[self.current_step-1, "bear_div"] == 1)
-                if self._open_position(-1, self.current_step - 1):
-                    penalty_pips = self.open_penalty_pips
-                    if not has_signal:
-                        penalty_pips += 0.3
-                    self.equity_usd -= penalty_pips * self.usd_per_pip
+                self._open_position(-1, next_bar)
         elif action == 3: # CLOSE
             if self.position != 0:
-                close_price = float(self.df.loc[self.current_step, "Close"])
-                _ = self._close_position("MANUAL_CLOSE", close_price)
+                self._close_position("MANUAL_CLOSE", next_bar["Open"])
 
-        # --- Внутрибаровая проверка SL/TP (трейлинг, срабатывания) ---
+        # --- Временной штраф за удержание позиции (начисляется в начале шага) ---
         if self.position != 0:
             self.time_in_trade += 1
             self.equity_usd -= self.time_penalty_pips * self.usd_per_pip
-            _ = self._check_sl_tp_intrabar()   # может закрыть позицию
 
-        # --- Запоминаем сигнал для закрытия на следующем баре ---
+        # --- Проверка SL/TP на следующем баре (высокая/низкая цена) ---
+        close_result = None
         if self.position != 0:
-            signal = self._get_auto_close_signal()
+            close_result = self._check_sl_tp_intrabar(next_bar)
+
+        # --- Проверка сигнала для автоматического закрытия (на основе следующего бара) ---
+        if self.position != 0:
+            signal = self._get_auto_close_signal(next_bar)
             if signal is not None:
                 self.pending_close_reason = signal
 
-        # --- Эквити на конец шага (по цене Close текущего бара) ---
-        current_close = self.df.loc[self.current_step, "Close"]
-        equity_end = self._get_equity_at_price(current_close)
+        # --- Эквити на конец шага (по Close следующего бара) ---
+        equity_end = self._get_equity_at_price(next_bar["Close"])
+
+        # --- Награда ---
+        reward_main_usd = equity_end - equity_start
+        # shaping-награда на основе slope_div текущего бара (для открытой позиции)
+        shaping_reward_usd = 0.0
+        if self.position != 0:
+            shaping_reward_usd = -curr_bar["slope_div"] * self.slope_div_reward_scale * self.usd_per_pip
+        total_reward_usd = reward_main_usd + shaping_reward_usd
+        reward = total_reward_usd * self.reward_scale
 
         # --- Переход к следующему бару ---
-        self.current_step += 1
+        self.current_idx += 1
+        self.next_idx += 1
 
         # --- Проверка окончания эпизода ---
-        if self.current_step >= self.n_steps - 1:
+        if self.next_idx >= self.n_steps:
             self.terminated = True
             if self.position != 0:
-                close_price = float(self.df.loc[self.n_steps - 1, "Close"])
-                _ = self._close_position("END_OF_DATA", close_price)
+                last_bar = self.df.iloc[-1]
+                self._close_position("END_OF_DATA", last_bar["Close"])
 
         if self.episode_max_steps is not None and self.steps_in_episode >= self.episode_max_steps:
             self.truncated = True
 
-        # --- Награда ---
-        reward = (equity_end - equity_start) * self.reward_scale
-
         obs = self._get_observation()
-        info = {"equity_usd": self._get_current_equity()}   # для визуализации
+        info = {"equity_usd": self._get_current_equity()}
         info["last_trade_info"] = self.last_trade_info
 
         if _GYMNASIUM:
             return obs, reward, self.terminated, self.truncated, info
         else:
             done = self.terminated or self.truncated
-            return obs, reward, done, info 
+            return obs, reward, done, info

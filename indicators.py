@@ -25,13 +25,13 @@ def load_and_preprocess_data(csv_path: str):
     df["cvd_avg"] = ta.alma(df["delta"], length=50, sigma=0.85, distribution_offset=4)
     df["price_avg"] = ta.alma(df["Close"], length=34, sigma=0.85, distribution_offset=4)
 
-    # сырые наклоны
-    cvd_linreg_curr = ta.linreg(df["cvd_avg"], length=8, offset=0).squeeze()
-    cvd_linreg_prev = ta.linreg(df["cvd_avg"], length=8, offset=1).squeeze()
+    # сырые наклоны – ИСПРАВЛЕНО: offset=1 и offset=2 для исключения текущего бара
+    cvd_linreg_curr = ta.linreg(df["cvd_avg"], length=8, offset=1).squeeze()
+    cvd_linreg_prev = ta.linreg(df["cvd_avg"], length=8, offset=2).squeeze()
     df["cvd_slope_raw"] = cvd_linreg_curr - cvd_linreg_prev
 
-    price_linreg_curr = ta.linreg(df["price_avg"], length=8, offset=0).squeeze()
-    price_linreg_prev = ta.linreg(df["price_avg"], length=8, offset=1).squeeze()
+    price_linreg_curr = ta.linreg(df["price_avg"], length=8, offset=1).squeeze()
+    price_linreg_prev = ta.linreg(df["price_avg"], length=8, offset=2).squeeze()
     df["price_slope_raw"] = price_linreg_curr - price_linreg_prev
 
     # волатильность и объём (ALMA)
@@ -56,24 +56,18 @@ def load_and_preprocess_data(csv_path: str):
     # отклонение цены от средней
     df["price_dist_from_avg"] = np.where(df["alma_atr"] != 0, (df["Close"] - df["price_avg"]) / df["alma_atr"], 0.0)
 
-    # относительный объём
-    df["relative_volume"] = np.where(df["alma_vol"] != 0, df["Volume"] / df["alma_vol"], 1.0)
+    # относительный объём – ИСПРАВЛЕНО: при alma_vol=0 ставим 0.0 (нет торгов)
+    df["relative_volume"] = np.where(df["alma_vol"] != 0, df["Volume"] / df["alma_vol"], 0.0)
 
     # ========== НОВЫЕ ПРИЗНАКИ ==========
-    # EMA 50 и 200
     df["ema_50"] = ta.ema(df["Close"], length=50)
     df["ema_200"] = ta.ema(df["Close"], length=200)
-    # Пересечение EMA (сигнал 1 если быстрая выше медленной, иначе 0)
     df["ema_cross"] = (df["ema_50"] > df["ema_200"]).astype(float)
-    # Логарифмическая доходность за 1 бар
     df["log_return"] = np.log(df["Close"] / df["Close"].shift(1))
-    # ATR ratio (ATR / Close)
     df["atr_ratio"] = df["alma_atr"] / df["Close"]
 
-    # удаляем строки с NaN (первые 300+ баров)
     df.dropna(inplace=True)
 
-    # Обновлённый список фичей
     feature_cols = [
         "alma_atr",
         "relative_volume",
@@ -85,8 +79,8 @@ def load_and_preprocess_data(csv_path: str):
         "price_slope",
         "bull_div",
         "bear_div",
-        "ema_cross",      # новое
-        "log_return",     # новое
-        "atr_ratio",      # новое
+        "ema_cross",
+        "log_return",
+        "atr_ratio",
     ]
     return df, feature_cols

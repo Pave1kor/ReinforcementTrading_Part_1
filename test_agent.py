@@ -1,18 +1,21 @@
 # -*- coding: utf-8 -*-
+import os
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 from sb3_contrib import RecurrentPPO
+from stable_baselines3.common.vec_env import VecNormalize
 from stable_baselines3.common.vec_env import DummyVecEnv
 
 from indicators import load_and_preprocess_data
 from trading_env import ForexTradingEnv
 
 def compute_full_metrics(equity_curve, trades_df=None, initial_equity=10000.0):
-    """Расчёт метрик (уже корректен, т.к. equity_curve включает плавающую прибыль)."""
+    # Исправлено: equity_curve уже включает начальную эквити? Нет, в run_one_episode мы будем добавлять initial_equity в список.
+    # Для единообразия оставляем формирование full_equity = [initial_equity] + equity_curve
     full_equity = np.array([initial_equity] + equity_curve)
     if len(full_equity) < 2:
-        return {k: 0.0 for k in ["sharpe", "sortino", "max_drawdown_pct", "calmar", 
+        return {k: 0.0 for k in ["sharpe", "sortino", "max_drawdown_pct", "calmar",
                                   "profit_factor", "win_rate", "avg_trade_usd", "turnover"]}
 
     returns = np.diff(full_equity) / full_equity[:-1]
@@ -66,10 +69,14 @@ def run_one_episode(model, vec_env, deterministic=True):
     obs = vec_env.reset()
     lstm_states = None
     episode_starts = np.ones((vec_env.num_envs,), dtype=bool)
-    initial_equity = vec_env.get_attr("initial_equity_usd")[0]
-    equity_curve = [initial_equity]
+    # Получаем начальную эквити
+    try:
+        initial_equity = vec_env.get_attr("initial_equity_usd")[0]
+    except:
+        initial_equity = 10000.0
+    equity_curve = []   # не включаем начальную эквити сюда
     closed_trades = []
-    
+
     while True:
         action, lstm_states = model.predict(
             obs, state=lstm_states, episode_start=episode_starts, deterministic=deterministic
@@ -90,13 +97,8 @@ def run_one_episode(model, vec_env, deterministic=True):
 
 def main():
     DATA_PATH = "data/EURUSD_Candlestick_1_Hour_BID_01.07.2020-15.07.2023.csv"
-    MODEL_PATH = "model_eurusd_best"   # после переобучения путь будет другой
+    MODEL_PATH = "model_eurusd_best"
     WIN = 60
-    # Используем новые параметры, согласованные с обучением
-    BASE_SL_PIPS = 45.0
-    BASE_TP_PIPS = 90.0
-    K_SL = 0.3
-    K_TP = 0.6
 
     df, feature_cols = load_and_preprocess_data(DATA_PATH)
 
@@ -119,21 +121,30 @@ def main():
         episode_max_steps=None,
         feature_mean=train_mean,
         feature_std=train_std,
-        base_sl_pips=BASE_SL_PIPS,
-        base_tp_pips=BASE_TP_PIPS,
-        k_sl=K_SL,
-        k_tp=K_TP,
-        risk_per_trade=0.005,          # уменьшено
-        open_penalty_pips=0.5,
-        time_penalty_pips=0.001,
-        trailing_atr_mult=2.0,         # динамический трейлинг
+        risk_per_trade=0.002,
+        base_sl_pips=30.0,
+        base_tp_pips=60.0,
+        k_sl=0.3,
+        k_tp=0.6,
+        open_penalty_pips=0.0,
+        time_penalty_pips=0.0005,
+        trailing_atr_mult=2.0,
         min_atr_pips=10.0,
+        slope_div_reward_scale=0.01,
+        open_bonus_pips=5.0,
+        reward_scale=0.001,
     )
+    vec_env = DummyVecEnv([lambda: test_env])
+    # Загружаем нормализацию, если есть
+    if os.path.exists("vec_normalize.pkl"):
+        vec_env = VecNormalize.load("vec_normalize.pkl", vec_env)
+        vec_env.training = False
+        vec_env.norm_reward = False
+    else:
+        vec_env = VecNormalize(vec_env, norm_obs=True, norm_reward=False, training=False)
+    model = RecurrentPPO.load(MODEL_PATH, env=vec_env)
 
-    vec_test_env = DummyVecEnv([lambda: test_env])
-    model = RecurrentPPO.load(MODEL_PATH, env=vec_test_env)
-
-    equity_curve, closed_trades = run_one_episode(model, vec_test_env, deterministic=True)
+    equity_curve, closed_trades = run_one_episode(model, vec_env, deterministic=True)
 
     trades_df = pd.DataFrame(closed_trades) if closed_trades else None
     metrics = compute_full_metrics(equity_curve, trades_df=trades_df, initial_equity=10000.0)
@@ -168,7 +179,7 @@ def main():
     plt.gca().text(0.02, 0.98, textstr, transform=plt.gca().transAxes, fontsize=10,
                    verticalalignment='top', bbox=props)
     plt.tight_layout()
-    plt.savefig("test_equity_curve.png", dpi=150)
+    plt.savefig("test_equity_curve.png")
     plt.show()
 
 if __name__ == "__main__":
