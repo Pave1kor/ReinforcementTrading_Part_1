@@ -331,9 +331,18 @@ class ForexTradingEnv(gym.Env):
         # Порог увеличен с 0.1 до 0.3
         if self.position == 1 and prev_bear and prev_slope_div < -0.3:
             return "BEAR_DIV"
-        if self.position == -1 and prev_bull and prev_slope_div > 0.3:
+        if self.position == -1 and prev_bull and prev_slope_div < -0.3:
             return "BULL_DIV"
         return None
+    def _get_equity_at_price(self, price: float) -> float:
+        if self.position == 0 or self.entry_price is None:
+            return self.equity_usd
+        if self.position == 1:
+            unrealized_pips = (price - self.entry_price) / self.pip_value
+        else:
+            unrealized_pips = (self.entry_price - price) / self.pip_value
+        unrealized_usd = unrealized_pips * self.usd_per_pip
+        return self.equity_usd + unrealized_usd
 
     def reset(self, seed=None, options=None):
         super().reset(seed=seed)
@@ -359,27 +368,25 @@ class ForexTradingEnv(gym.Env):
 
         self.steps_in_episode += 1
 
-        # Запоминаем полную эквити до всех изменений (для награды)
-        equity_before = self._get_current_equity()
+        # --- Эквити на начало шага (по цене закрытия предыдущего бара) ---
+        prev_idx = max(0, self.current_step - 1)
+        prev_close = self.df.loc[prev_idx, "Close"]
+        equity_start = self._get_equity_at_price(prev_close)
 
-        # Отложенное закрытие по дивергенции
+        # --- Обработка отложенного закрытия по дивергенции (по Open текущего бара) ---
         if self.pending_close_reason is not None:
             close_price = float(self.df.loc[self.current_step, "Open"])
             _ = self._close_position(self.pending_close_reason, close_price)
             self.pending_close_reason = None
 
         # --- Действие агента ---
-        # Штраф за открытие (оставляем небольшой, так как основная награда — от изменения эквити)
         if action == 1:   # OPEN_LONG
             if self.position == 0:
                 has_signal = (self.df.loc[self.current_step-1, "bull_div"] == 1)
                 if self._open_position(1, self.current_step - 1):
-                    # Небольшой штраф за открытие (в пипсах, потом пересчитаем в доллары)
-                    # Открытие без сигнала штрафуется сильнее
                     penalty_pips = self.open_penalty_pips
                     if not has_signal:
                         penalty_pips += 0.3
-                    # Переводим штраф в доллары (приблизительно)
                     self.equity_usd -= penalty_pips * self.usd_per_pip
         elif action == 2: # OPEN_SHORT
             if self.position == 0:
@@ -394,21 +401,21 @@ class ForexTradingEnv(gym.Env):
                 close_price = float(self.df.loc[self.current_step, "Close"])
                 _ = self._close_position("MANUAL_CLOSE", close_price)
 
-        # --- Внутрибаровая проверка SL/TP ---
+        # --- Внутрибаровая проверка SL/TP (трейлинг, срабатывания) ---
         if self.position != 0:
             self.time_in_trade += 1
-            # Штраф за время (маленький)
             self.equity_usd -= self.time_penalty_pips * self.usd_per_pip
-            sl_tp_reward_pips = self._check_sl_tp_intrabar()
-            if sl_tp_reward_pips is not None:
-                # Если закрылись по SL/TP, то equity_usd уже обновлён в _close_position
-                pass   # награда будет учтена через изменение эквити
+            _ = self._check_sl_tp_intrabar()   # может закрыть позицию
 
         # --- Запоминаем сигнал для закрытия на следующем баре ---
         if self.position != 0:
             signal = self._get_auto_close_signal()
             if signal is not None:
                 self.pending_close_reason = signal
+
+        # --- Эквити на конец шага (по цене Close текущего бара) ---
+        current_close = self.df.loc[self.current_step, "Close"]
+        equity_end = self._get_equity_at_price(current_close)
 
         # --- Переход к следующему бару ---
         self.current_step += 1
@@ -423,18 +430,15 @@ class ForexTradingEnv(gym.Env):
         if self.episode_max_steps is not None and self.steps_in_episode >= self.episode_max_steps:
             self.truncated = True
 
-        # --- Расчёт награды как изменение полной эквити (в USD), затем масштабирование ---
-        equity_after = self._get_current_equity()
-        reward_usd = equity_after - equity_before
-        reward = reward_usd * self.reward_scale   # reward_scale можно оставить 1.0
+        # --- Награда ---
+        reward = (equity_end - equity_start) * self.reward_scale
 
-        # Формируем observation и info
         obs = self._get_observation()
-        info = {"equity_usd": equity_after}
+        info = {"equity_usd": self._get_current_equity()}   # для визуализации
         info["last_trade_info"] = self.last_trade_info
 
         if _GYMNASIUM:
             return obs, reward, self.terminated, self.truncated, info
         else:
             done = self.terminated or self.truncated
-            return obs, reward, done, info
+            return obs, reward, done, info 
