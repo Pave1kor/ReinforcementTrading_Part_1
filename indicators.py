@@ -5,7 +5,7 @@ import pandas_ta as ta
 def load_and_preprocess_data(csv_path: str):
     """
     Загрузка данных и расчёт признаков БЕЗ look-ahead.
-    Все признаки рассчитываются на основе доступных на момент закрытия бара данных.
+    Добавлены EMA 50/200, их пересечение и логарифмическая доходность.
     """
     df = pd.read_csv(csv_path, parse_dates=["Time (EET)"], dayfirst=True)
     df.columns = df.columns.str.strip()
@@ -43,8 +43,7 @@ def load_and_preprocess_data(csv_path: str):
     df["price_slope"] = np.where(df["alma_atr"] != 0, df["price_slope_raw"] / df["alma_atr"], df["price_slope_raw"])
     df["cvd_slope"] = np.where(df["alma_vol"] != 0, df["cvd_slope_raw"] / df["alma_vol"], df["cvd_slope_raw"])
 
-    df["slope_div"] = df["price_slope"] * df["cvd_slope"]*10000.0
-    # ИЗМЕНЕНО: добавлен абсолютный slope_div для фильтрации сигналов
+    df["slope_div"] = df["price_slope"] * df["cvd_slope"] * 10000.0
     df["abs_slope_div"] = df["slope_div"].abs()
 
     # дивергенции
@@ -60,10 +59,21 @@ def load_and_preprocess_data(csv_path: str):
     # относительный объём
     df["relative_volume"] = np.where(df["alma_vol"] != 0, df["Volume"] / df["alma_vol"], 1.0)
 
+    # ========== НОВЫЕ ПРИЗНАКИ ==========
+    # EMA 50 и 200
+    df["ema_50"] = ta.ema(df["Close"], length=50)
+    df["ema_200"] = ta.ema(df["Close"], length=200)
+    # Пересечение EMA (сигнал 1 если быстрая выше медленной, иначе 0)
+    df["ema_cross"] = (df["ema_50"] > df["ema_200"]).astype(float)
+    # Логарифмическая доходность за 1 бар
+    df["log_return"] = np.log(df["Close"] / df["Close"].shift(1))
+    # ATR ratio (ATR / Close)
+    df["atr_ratio"] = df["alma_atr"] / df["Close"]
+
     # удаляем строки с NaN (первые 300+ баров)
     df.dropna(inplace=True)
 
-    # ИЗМЕНЕНО: добавлен abs_slope_div в список фичей
+    # Обновлённый список фичей
     feature_cols = [
         "alma_atr",
         "relative_volume",
@@ -75,5 +85,8 @@ def load_and_preprocess_data(csv_path: str):
         "price_slope",
         "bull_div",
         "bear_div",
+        "ema_cross",      # новое
+        "log_return",     # новое
+        "atr_ratio",      # новое
     ]
     return df, feature_cols

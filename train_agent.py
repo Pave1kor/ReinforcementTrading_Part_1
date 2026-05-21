@@ -21,11 +21,11 @@ def compute_metrics(equity_curve, initial_equity=10000.0):
     return sharpe, max_dd
 
 def evaluate_model(model, eval_env, deterministic=True):
+    """Оценка модели с корректной кривой эквити."""
     obs = eval_env.reset()
     lstm_states = None
     episode_starts = np.ones((eval_env.num_envs,), dtype=bool)
     equity_curve = []
-    # ИЗМЕНЕНО: запоминаем начальную эквити из среды
     initial_equity = eval_env.get_attr("initial_equity_usd")[0]
     equity_curve.append(initial_equity)
     while True:
@@ -71,14 +71,15 @@ def main():
             episode_max_steps=800,
             feature_mean=train_mean,
             feature_std=train_std,
-            risk_per_trade=0.007,        # ИЗМЕНЕНО: увеличено
-            base_sl_pips=35.0,           # ИЗМЕНЕНО
-            base_tp_pips=70.0,           # ИЗМЕНЕНО
-            k_sl=0.3,                    # ИЗМЕНЕНО
-            k_tp=0.6,                    # ИЗМЕНЕНО
-            open_penalty_pips=0.5,       # ИЗМЕНЕНО
-            time_penalty_pips=0.001,     # ИЗМЕНЕНО
-            trailing_trigger_pips=30.0,  # ИЗМЕНЕНО: добавлено
+            risk_per_trade=0.005,
+            base_sl_pips=45.0,
+            base_tp_pips=90.0,
+            k_sl=0.3,
+            k_tp=0.6,
+            open_penalty_pips=0.5,
+            time_penalty_pips=0.001,
+            trailing_atr_mult=2.0,
+            min_atr_pips=10.0,
         )
 
     def make_eval_env(df):
@@ -93,14 +94,15 @@ def main():
             episode_max_steps=None,
             feature_mean=train_mean,
             feature_std=train_std,
-            risk_per_trade=0.007,
-            base_sl_pips=35.0,
-            base_tp_pips=70.0,
+            risk_per_trade=0.005,
+            base_sl_pips=45.0,
+            base_tp_pips=90.0,
             k_sl=0.3,
             k_tp=0.6,
             open_penalty_pips=0.5,
             time_penalty_pips=0.001,
-            trailing_trigger_pips=30.0,
+            trailing_atr_mult=2.0,
+            min_atr_pips=10.0,
         )
 
     train_vec_env = SubprocVecEnv([lambda i=i: make_train_env() for i in range(NUM_ENVS)])
@@ -113,27 +115,28 @@ def main():
     test_eval_env = DummyVecEnv([lambda: make_eval_env(test_df)])
 
     policy_kwargs = dict(
-        net_arch=dict(shared=[128], pi=[64], vf=[64]),  # ИЗМЕНЕНО: увеличены размеры
+        net_arch=dict(shared=[128], pi=[64], vf=[64]),
         lstm_hidden_size=48,
         n_lstm_layers=1
     )
 
+    # НОВЫЕ ГИПЕРПАРАМЕТРЫ
     model = RecurrentPPO(
         policy="MlpLstmPolicy",
         env=train_vec_env,
         verbose=1,
         tensorboard_log="./tensorboard_log/",
         policy_kwargs=policy_kwargs,
-        ent_coef=0.01,                 # ИЗМЕНЕНО: увеличено
-        learning_rate=3e-5,            # ИЗМЕНЕНО: увеличено
+        ent_coef=0.001,          # уменьшено
+        learning_rate=1e-4,      # увеличено
         n_steps=4096,
         batch_size=256,
         n_epochs=4,
         gamma=0.99,
         gae_lambda=0.95,
-        clip_range=0.2,
-        vf_coef=1.0,                   # ИЗМЕНЕНО: увеличено для лучшей оценки value
-        max_grad_norm=0.5,             # ИЗМЕНЕНО: добавлено
+        clip_range=0.3,          # увеличено
+        vf_coef=0.5,             # уменьшено
+        max_grad_norm=0.5,
     )
 
     os.makedirs("./checkpoints", exist_ok=True)
@@ -142,7 +145,7 @@ def main():
                                  log_path="./eval_log", eval_freq=10000,
                                  deterministic=True, render=False)
 
-    model.learn(total_timesteps=500_000, callback=[checkpoint_callback, eval_callback])  # увеличено до 2M
+    model.learn(total_timesteps=2_000_000, callback=[checkpoint_callback, eval_callback])
     model.save("model_eurusd_best")
 
     # Оценка

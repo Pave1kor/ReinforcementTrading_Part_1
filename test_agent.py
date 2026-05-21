@@ -9,9 +9,7 @@ from indicators import load_and_preprocess_data
 from trading_env import ForexTradingEnv
 
 def compute_full_metrics(equity_curve, trades_df=None, initial_equity=10000.0):
-    """
-    Расширенный расчёт метрик с учётом начального капитала и долларового PnL.
-    """
+    """Расчёт метрик (уже корректен, т.к. equity_curve включает плавающую прибыль)."""
     full_equity = np.array([initial_equity] + equity_curve)
     if len(full_equity) < 2:
         return {k: 0.0 for k in ["sharpe", "sortino", "max_drawdown_pct", "calmar", 
@@ -47,8 +45,7 @@ def compute_full_metrics(equity_curve, trades_df=None, initial_equity=10000.0):
     }
 
     if trades_df is not None and len(trades_df) > 0:
-        # ИЗМЕНЕНО: используем долларовый PnL
-        dollar_pnl = trades_df['net_pips'] * trades_df['lot_size'] * 0.0001  # pip_value = 0.0001
+        dollar_pnl = trades_df['net_pips'] * trades_df['lot_size'] * 0.0001
         gains = dollar_pnl[dollar_pnl > 0].sum()
         losses = abs(dollar_pnl[dollar_pnl < 0].sum())
         profit_factor = gains / losses if losses > 0 else np.inf
@@ -66,7 +63,6 @@ def compute_full_metrics(equity_curve, trades_df=None, initial_equity=10000.0):
     return metrics
 
 def run_one_episode(model, vec_env, deterministic=True):
-    """Запуск одного эпизода и сбор кривой эквити и закрытых сделок."""
     obs = vec_env.reset()
     lstm_states = None
     episode_starts = np.ones((vec_env.num_envs,), dtype=bool)
@@ -86,7 +82,6 @@ def run_one_episode(model, vec_env, deterministic=True):
         equity_curve.append(float(info["equity_usd"]))
         trade_info = info.get("last_trade_info")
         if trade_info and trade_info.get("event") == "CLOSE":
-            # избегаем дублей
             if not closed_trades or closed_trades[-1] != trade_info:
                 closed_trades.append(trade_info)
         if done:
@@ -95,10 +90,11 @@ def run_one_episode(model, vec_env, deterministic=True):
 
 def main():
     DATA_PATH = "data/EURUSD_Candlestick_1_Hour_BID_01.07.2020-15.07.2023.csv"
-    MODEL_PATH = "model_eurusd_best"
+    MODEL_PATH = "model_eurusd_best"   # после переобучения путь будет другой
     WIN = 60
-    BASE_SL_PIPS = 35.0      # ИЗМЕНЕНО: соответствие обучению
-    BASE_TP_PIPS = 70.0
+    # Используем новые параметры, согласованные с обучением
+    BASE_SL_PIPS = 45.0
+    BASE_TP_PIPS = 90.0
     K_SL = 0.3
     K_TP = 0.6
 
@@ -127,10 +123,11 @@ def main():
         base_tp_pips=BASE_TP_PIPS,
         k_sl=K_SL,
         k_tp=K_TP,
-        risk_per_trade=0.007,
+        risk_per_trade=0.005,          # уменьшено
         open_penalty_pips=0.5,
         time_penalty_pips=0.001,
-        trailing_trigger_pips=30.0,
+        trailing_atr_mult=2.0,         # динамический трейлинг
+        min_atr_pips=10.0,
     )
 
     vec_test_env = DummyVecEnv([lambda: test_env])
@@ -161,7 +158,7 @@ def main():
 
     plt.figure(figsize=(12, 6))
     plt.plot(equity_curve, label=f"Equity (final: {metrics['final_equity']:.2f} USD)", linewidth=1.5)
-    plt.title("Test Episode Equity Curve")
+    plt.title("Test Episode Equity Curve (with unrealized PnL)")
     plt.xlabel("Bars")
     plt.ylabel("Equity (USD)")
     plt.grid(True, alpha=0.3)
