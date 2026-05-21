@@ -1,5 +1,6 @@
 from __future__ import annotations
 import numpy as np
+import pandas as pd
 try:
     import gymnasium as gym
     from gymnasium import spaces
@@ -10,12 +11,6 @@ except ImportError:
     _GYMNASIUM = False
 
 class ForexTradingEnv(gym.Env):
-    """
-    Торговая среда для EUR/USD с динамическими SL/TP,
-    корректным учётом нереализованной прибыли и shaping-наградой на основе slope_div.
-    ИСПРАВЛЕНА ВРЕМЕННАЯ ЛОГИКА: каждый шаг соответствует одному закрытому бару,
-    исполнение сделок происходит на следующем баре.
-    """
     metadata = {"render_modes": ["human"]}
 
     def __init__(
@@ -23,32 +18,28 @@ class ForexTradingEnv(gym.Env):
         df,
         window_size: int = 60,
         feature_columns=None,
-        pip_value: float = 0.0001,
+        pip_value: float = 0.01,          # 1 копейка
         spread_pips: float = 1.0,
         commission_pips: float = 0.0,
-        max_slippage_pips: float = 0.5,
-        lot_size: float = 100000.0,
-        risk_per_trade: float = 0.002,          # уменьшено с 0.005
-        leverage: float = 50.0,
-        reward_scale: float = 0.0001,
+        max_slippage_pips: float = 1.0,
+        lot_size: float = 1.0,
+        risk_per_trade: float = 0.005,
+        leverage: float = 1.0,
+        reward_scale: float = 0.002,
         random_start: bool = True,
         min_episode_steps: int = 300,
         episode_max_steps: int | None = None,
         feature_mean: np.ndarray | None = None,
         feature_std: np.ndarray | None = None,
-        # Параметры SL/TP
-        base_sl_pips: float = 30.0,             # уменьшено с 45
-        base_tp_pips: float = 60.0,             # уменьшено с 90
+        base_sl_pips: float = 40.0,
+        base_tp_pips: float = 80.0,
         k_sl: float = 0.3,
         k_tp: float = 0.6,
-        # Штрафы
-        open_penalty_pips: float = 0.0,         # убран штраф
-        time_penalty_pips: float = 0.0005,      # уменьшен
-        # Трейлинг и фильтры
+        open_penalty_pips: float = 0.0,
+        time_penalty_pips: float = 0.0005,
         trailing_atr_mult: float = 2.0,
-        min_atr_pips: float = 10.0,
-        # Shaping и бонусы
-        slope_div_reward_scale: float = 0.01,
+        min_atr_pips: float = 5.0,
+        slope_div_reward_scale: float = 0.002,
         open_bonus_pips: float = 5.0,
     ):
         super().__init__()
@@ -95,8 +86,8 @@ class ForexTradingEnv(gym.Env):
         self._reset_state()
 
     def _reset_state(self):
-        self.current_idx = 0          # индекс текущего закрытого бара (для наблюдения)
-        self.next_idx = 1             # индекс следующего бара (для исполнения)
+        self.current_idx = 0
+        self.next_idx = 1
         self.steps_in_episode = 0
         self.terminated = False
         self.truncated = False
@@ -106,15 +97,14 @@ class ForexTradingEnv(gym.Env):
         self.tp_price = None
         self.time_in_trade = 0
         self.entry_slope = 0.0
-        self.initial_equity_usd = 10000.0
+        self.initial_equity_usd = 100000.0
         self.equity_usd = self.initial_equity_usd
+        self.peak_equity = self.initial_equity_usd
         self.last_trade_info = None
         self.usd_per_pip = self.pip_value * self.lot_size
         self.pending_close_reason = None
 
-    # ---------- Вспомогательные методы для эквити ----------
     def _get_equity_at_price(self, price: float) -> float:
-        """Полная эквити (закрытый PnL + переоценка открытой позиции по заданной цене)."""
         if self.position == 0 or self.entry_price is None:
             return self.equity_usd
         if self.position == 1:
@@ -125,12 +115,10 @@ class ForexTradingEnv(gym.Env):
         return self.equity_usd + unrealized_usd
 
     def _get_current_equity(self) -> float:
-        """Текущая полная эквити (по цене Close текущего бара)."""
         current_close = self.df.loc[self.current_idx, "Close"]
         return self._get_equity_at_price(current_close)
 
     def _get_state_features(self):
-        """Состояние агента (нормированные показатели)."""
         pos = float(self.position)
         t_norm = float(self.time_in_trade) / 100.0
         if self.position != 0:
@@ -149,7 +137,6 @@ class ForexTradingEnv(gym.Env):
     def _apply_normalization(self, obs):
         if self.feature_mean is None or self.feature_std is None:
             return obs
-        # защита от NaN в std
         std = np.where(self.feature_std == 0, 1.0, self.feature_std)
         std = np.nan_to_num(std, nan=1.0)
         obs = (obs - self.feature_mean) / std
@@ -171,7 +158,6 @@ class ForexTradingEnv(gym.Env):
         obs = np.hstack([base, state_block]).astype(np.float32)
         return obs
 
-    # ---------- Торговые вспомогательные методы ----------
     def _sample_slippage_pips(self):
         if self.max_slippage_pips <= 0:
             return 0.0
@@ -190,7 +176,7 @@ class ForexTradingEnv(gym.Env):
         tp_mult = 1 + self.k_tp * abs_slope
         sl_pips = base_sl * sl_mult * vol_factor
         tp_pips = base_tp * tp_mult * vol_factor
-        sl_pips = np.clip(sl_pips, 10.0, 100.0)
+        sl_pips = np.clip(sl_pips, 5.0, 100.0)
         tp_pips = max(tp_pips, sl_pips * 1.2)
         return sl_pips, tp_pips
 
@@ -199,10 +185,6 @@ class ForexTradingEnv(gym.Env):
         return self._get_current_equity() > required_margin * 1.05
 
     def _open_position(self, direction: int, bar):
-        """
-        Открытие позиции на основе данных следующего бара (bar).
-        bar – pd.Series с полями Open, High, Low, Close, alma_atr, slope_div и т.д.
-        """
         if self.position != 0:
             return False
 
@@ -220,10 +202,10 @@ class ForexTradingEnv(gym.Env):
         if self.risk_per_trade > 0:
             risk_amount = self._get_current_equity() * self.risk_per_trade
             lot_size = risk_amount / (sl_pips * self.pip_value)
-            lot_size = np.clip(lot_size, 1000.0, 100000.0)
+            lot_size = np.clip(lot_size, 1.0, 1000.0)
             max_lot_by_margin = (self._get_current_equity() * self.leverage) / (entry_base_price * 1.2)
             lot_size = min(lot_size, max_lot_by_margin)
-            lot_size = max(lot_size, 1000.0)
+            lot_size = max(lot_size, 1.0)
         else:
             lot_size = self.lot_size
 
@@ -237,16 +219,15 @@ class ForexTradingEnv(gym.Env):
         slip_pips = self._sample_slippage_pips()
         slip_price = slip_pips * self.pip_value
 
-        if direction == 1:  # long
+        if direction == 1:
             entry = entry_base_price + slip_price
-            # Ограничиваем цену входа диапазоном High/Low бара (реалистичность)
             high = float(bar["High"])
             low = float(bar["Low"])
             entry = np.clip(entry, low, high)
             sl_price = entry - sl_pips * self.pip_value
             tp_price = entry + tp_pips * self.pip_value
             self.position = 1
-        else:               # short
+        else:
             entry = entry_base_price - slip_price
             high = float(bar["High"])
             low = float(bar["Low"])
@@ -271,11 +252,9 @@ class ForexTradingEnv(gym.Env):
             "atr_pips": current_atr,
             "lot_size": lot_size
         }
-        # Применяем штраф за открытие (если есть)
         penalty_usd = self.open_penalty_pips * self.usd_per_pip
         if penalty_usd > 0:
             self.equity_usd -= penalty_usd
-        # Бонус при отрицательном slope_div
         if self.open_bonus_pips > 0 and slope_val < 0:
             self.equity_usd += self.open_bonus_pips * self.usd_per_pip
         return True
@@ -312,10 +291,6 @@ class ForexTradingEnv(gym.Env):
         return net_pips
 
     def _check_sl_tp_intrabar(self, bar):
-        """
-        Проверка срабатывания стоп-лосса или тейк-профита на баре (High/Low).
-        Возвращает net_pips, если позиция закрыта, иначе None.
-        """
         if self.position == 0:
             return None
         high = float(bar["High"])
@@ -324,17 +299,15 @@ class ForexTradingEnv(gym.Env):
         trailing_trigger = current_atr * self.trailing_atr_mult
 
         if self.position == 1:
-            # трейлинг стоп (перемещаем SL в безубыток при проходе цены)
             if high >= self.entry_price + trailing_trigger * self.pip_value:
                 new_sl = self.entry_price
                 if new_sl > self.sl_price:
                     self.sl_price = new_sl
-            # сначала проверяем TP, потом SL (по логике внутрибарового исполнения)
             if high >= self.tp_price:
                 return self._close_position("TP_HIT", self.tp_price)
             if low <= self.sl_price:
                 return self._close_position("SL_HIT", self.sl_price)
-        else:  # short
+        else:
             if low <= self.entry_price - trailing_trigger * self.pip_value:
                 new_sl = self.entry_price
                 if new_sl < self.sl_price:
@@ -346,9 +319,6 @@ class ForexTradingEnv(gym.Env):
         return None
 
     def _get_auto_close_signal(self, bar):
-        """
-        Сигнал автоматического закрытия по дивергенции на основе текущего бара.
-        """
         if self.position == 0:
             return None
         bull = bar["bull_div"] == 1
@@ -360,7 +330,6 @@ class ForexTradingEnv(gym.Env):
             return "BULL_DIV"
         return None
 
-    # ---------- Основные методы gym ----------
     def reset(self, seed=None, options=None):
         super().reset(seed=seed)
         self._reset_state()
@@ -373,7 +342,6 @@ class ForexTradingEnv(gym.Env):
             self.current_idx = self.window_size
             self.next_idx = self.window_size + 1
 
-        # Убедимся, что next_idx не выходит за границы
         if self.next_idx >= self.n_steps:
             self.next_idx = self.n_steps - 1
             self.current_idx = self.next_idx - 1
@@ -393,12 +361,10 @@ class ForexTradingEnv(gym.Env):
 
         self.steps_in_episode += 1
 
-        # Данные текущего бара (для наблюдения) и следующего (для исполнения)
         curr_bar = self.df.iloc[self.current_idx]
         next_bar = self.df.iloc[self.next_idx] if self.next_idx < self.n_steps else None
 
         if next_bar is None:
-            # Данные закончились – принудительное завершение
             self.terminated = True
             if self.position != 0:
                 last_close = curr_bar["Close"]
@@ -409,58 +375,65 @@ class ForexTradingEnv(gym.Env):
                 return obs, 0.0, True, False, info
             return obs, 0.0, True, info
 
-        # Эквити на начало шага (по Close текущего бара)
         equity_start = self._get_equity_at_price(curr_bar["Close"])
 
-        # --- Обработка отложенного закрытия по дивергенции ---
         if self.pending_close_reason is not None:
             self._close_position(self.pending_close_reason, next_bar["Open"])
             self.pending_close_reason = None
 
-        # --- Действие агента ---
-        if action == 1:   # OPEN_LONG
+        if action == 1:
             if self.position == 0:
                 self._open_position(1, next_bar)
-        elif action == 2: # OPEN_SHORT
+        elif action == 2:
             if self.position == 0:
                 self._open_position(-1, next_bar)
-        elif action == 3: # CLOSE
+        elif action == 3:
             if self.position != 0:
                 self._close_position("MANUAL_CLOSE", next_bar["Open"])
 
-        # --- Временной штраф за удержание позиции (начисляется в начале шага) ---
         if self.position != 0:
             self.time_in_trade += 1
             self.equity_usd -= self.time_penalty_pips * self.usd_per_pip
 
-        # --- Проверка SL/TP на следующем баре (высокая/низкая цена) ---
-        close_result = None
         if self.position != 0:
-            close_result = self._check_sl_tp_intrabar(next_bar)
+            self._check_sl_tp_intrabar(next_bar)
 
-        # --- Проверка сигнала для автоматического закрытия (на основе следующего бара) ---
         if self.position != 0:
             signal = self._get_auto_close_signal(next_bar)
             if signal is not None:
                 self.pending_close_reason = signal
 
-        # --- Эквити на конец шага (по Close следующего бара) ---
         equity_end = self._get_equity_at_price(next_bar["Close"])
 
-        # --- Награда ---
-        reward_main_usd = equity_end - equity_start
-        # shaping-награда на основе slope_div текущего бара (для открытой позиции)
-        shaping_reward_usd = 0.0
-        if self.position != 0:
-            shaping_reward_usd = -curr_bar["slope_div"] * self.slope_div_reward_scale * self.usd_per_pip
-        total_reward_usd = reward_main_usd + shaping_reward_usd
-        reward = total_reward_usd * self.reward_scale
+        # -------- НАГРАДА (без шума) --------
+        pnl_usd = equity_end - equity_start
+        atr_pips = curr_bar["alma_atr"] / self.pip_value
+        atr_usd = atr_pips * self.usd_per_pip if self.usd_per_pip > 0 else 1.0
+        atr_usd = max(atr_usd, 1.0)
 
-        # --- Переход к следующему бару ---
+        risk_adjusted_pnl = pnl_usd / atr_usd
+
+        self.peak_equity = max(self.peak_equity, equity_end)
+        drawdown = (self.peak_equity - equity_end) / self.peak_equity if self.peak_equity > 0 else 0
+        drawdown_penalty = -drawdown * 5.0
+
+        action_bonus = 0.0
+        if action in (1, 2) and self.position != 0:
+            action_bonus = 0.02
+        elif action == 3 and self.position == 0:
+            action_bonus = 0.01
+
+        shaping_usd = 0.0
+        if self.position != 0:
+            shaping_usd = -curr_bar["slope_div"] * self.slope_div_reward_scale * self.usd_per_pip
+
+        raw_reward = risk_adjusted_pnl + drawdown_penalty + action_bonus + (shaping_usd / atr_usd)
+        reward = raw_reward * self.reward_scale
+        # ------------------------------------
+
         self.current_idx += 1
         self.next_idx += 1
 
-        # --- Проверка окончания эпизода ---
         if self.next_idx >= self.n_steps:
             self.terminated = True
             if self.position != 0:
