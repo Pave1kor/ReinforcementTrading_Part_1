@@ -18,7 +18,7 @@ class ForexTradingEnv(gym.Env):
         df,
         window_size: int = 60,
         feature_columns=None,
-        pip_value: float = 0.01,          # 1 копейка
+        pip_value: float = 0.01,
         spread_pips: float = 1.0,
         commission_pips: float = 0.0,
         max_slippage_pips: float = 1.0,
@@ -73,10 +73,11 @@ class ForexTradingEnv(gym.Env):
         self.k_sl = k_sl
         self.k_tp = k_tp
 
-        self.action_space = spaces.Discrete(4)  # 0:HOLD, 1:OPEN_LONG, 2:OPEN_SHORT, 3:CLOSE
+        # Действия: 0=HOLD, 1=CLOSE, 2-6=LONG_lot1-5, 7-11=SHORT_lot1-5
+        self.action_space = spaces.Discrete(12)
 
         self.base_num_features = len(self.feature_columns)
-        self.state_num_features = 5
+        self.state_num_features = 6
         self.num_features = self.base_num_features + self.state_num_features
         self.observation_space = spaces.Box(
             low=-np.inf, high=np.inf,
@@ -101,8 +102,9 @@ class ForexTradingEnv(gym.Env):
         self.equity_usd = self.initial_equity_usd
         self.peak_equity = self.initial_equity_usd
         self.last_trade_info = None
-        self.usd_per_pip = self.pip_value * self.lot_size
+        self.usd_per_pip = self.pip_value * 1.0
         self.pending_close_reason = None
+        self.last_lot_multiplier = 1
 
     def _get_equity_at_price(self, price: float) -> float:
         if self.position == 0 or self.entry_price is None:
@@ -132,7 +134,8 @@ class ForexTradingEnv(gym.Env):
         unreal_scaled = unreal_pips / 50.0
         is_flat = 1.0 if self.position == 0 else 0.0
         entry_slope_scaled = self.entry_slope * 10000.0
-        return np.array([pos, t_norm, unreal_scaled, is_flat, entry_slope_scaled], dtype=np.float32)
+        lot_mult_norm = float(self.last_lot_multiplier) / 5.0
+        return np.array([pos, t_norm, unreal_scaled, is_flat, entry_slope_scaled, lot_mult_norm], dtype=np.float32)
 
     def _apply_normalization(self, obs):
         if self.feature_mean is None or self.feature_std is None:
@@ -184,7 +187,7 @@ class ForexTradingEnv(gym.Env):
         required_margin = (lot_size * entry_price) / self.leverage
         return self._get_current_equity() > required_margin * 1.05
 
-    def _open_position(self, direction: int, bar):
+    def _open_position(self, direction: int, bar, lot_multiplier: int = 1):
         if self.position != 0:
             return False
 
@@ -192,22 +195,31 @@ class ForexTradingEnv(gym.Env):
         current_atr = float(bar["alma_atr"]) / self.pip_value
         if current_atr <= 1e-6:
             current_atr = 15.0
-
         if current_atr < self.min_atr_pips:
             return False
 
         slope_val = float(bar["slope_div"])
         sl_pips, tp_pips = self._compute_sl_tp(direction, slope_val, current_atr)
 
-        if self.risk_per_trade > 0:
-            risk_amount = self._get_current_equity() * self.risk_per_trade
-            lot_size = risk_amount / (sl_pips * self.pip_value)
-            lot_size = np.clip(lot_size, 1.0, 1000.0)
-            max_lot_by_margin = (self._get_current_equity() * self.leverage) / (entry_base_price * 1.2)
-            lot_size = min(lot_size, max_lot_by_margin)
-            lot_size = max(lot_size, 1.0)
-        else:
-            lot_size = self.lot_size
+        # ===== ДИНАМИЧЕСКАЯ КОРРЕКТИРОВКА SL/TP В ЗАВИСИМОСТИ ОТ ЛОТА =====
+        if lot_multiplier == 1:
+            # Консервативная сделка: короткий стоп и тейк
+            sl_pips = min(sl_pips, 30.0)
+            tp_pips = min(tp_pips, 45.0)
+        elif lot_multiplier in (4, 5):
+            # Агрессивная сделка: широкий стоп и дальний тейк
+            sl_pips = max(sl_pips, 60.0)
+            tp_pips = max(tp_pips, 150.0)
+        # для лотов 2 и 3 – оставляем рассчитанные значения
+        # ==============================================================
+
+        # Расчёт размера позиции с учётом множителя лота
+        risk_amount = self._get_current_equity() * self.risk_per_trade * lot_multiplier
+        lot_size = risk_amount / (sl_pips * self.pip_value)
+        lot_size = np.clip(lot_size, 1.0, 5000.0)
+        max_lot_by_margin = (self._get_current_equity() * self.leverage) / (entry_base_price * 1.2)
+        lot_size = min(lot_size, max_lot_by_margin)
+        lot_size = max(lot_size, 1.0)
 
         if lot_size <= 0:
             return False
@@ -241,6 +253,7 @@ class ForexTradingEnv(gym.Env):
         self.tp_price = tp_price
         self.time_in_trade = 0
         self.entry_slope = slope_val
+        self.last_lot_multiplier = lot_multiplier
         self.last_trade_info = {
             "event": "OPEN",
             "step": self.current_idx,
@@ -250,7 +263,10 @@ class ForexTradingEnv(gym.Env):
             "tp_price": self.tp_price,
             "slope_div": slope_val,
             "atr_pips": current_atr,
-            "lot_size": lot_size
+            "lot_size": lot_size,
+            "lot_multiplier": lot_multiplier,
+            "sl_pips": sl_pips,
+            "tp_pips": tp_pips
         }
         penalty_usd = self.open_penalty_pips * self.usd_per_pip
         if penalty_usd > 0:
@@ -381,15 +397,20 @@ class ForexTradingEnv(gym.Env):
             self._close_position(self.pending_close_reason, next_bar["Open"])
             self.pending_close_reason = None
 
-        if action == 1:
-            if self.position == 0:
-                self._open_position(1, next_bar)
-        elif action == 2:
-            if self.position == 0:
-                self._open_position(-1, next_bar)
-        elif action == 3:
+        # Декодируем действие
+        if action == 0:
+            pass   # HOLD
+        elif action == 1:
             if self.position != 0:
                 self._close_position("MANUAL_CLOSE", next_bar["Open"])
+        elif 2 <= action <= 6:
+            if self.position == 0:
+                lot_mult = action - 1   # 2→1, 3→2, ..., 6→5
+                self._open_position(1, next_bar, lot_mult)
+        elif 7 <= action <= 11:
+            if self.position == 0:
+                lot_mult = action - 6   # 7→1, ..., 11→5
+                self._open_position(-1, next_bar, lot_mult)
 
         if self.position != 0:
             self.time_in_trade += 1
@@ -405,12 +426,11 @@ class ForexTradingEnv(gym.Env):
 
         equity_end = self._get_equity_at_price(next_bar["Close"])
 
-        # -------- НАГРАДА (без шума) --------
+        # Награда
         pnl_usd = equity_end - equity_start
         atr_pips = curr_bar["alma_atr"] / self.pip_value
         atr_usd = atr_pips * self.usd_per_pip if self.usd_per_pip > 0 else 1.0
         atr_usd = max(atr_usd, 1.0)
-
         risk_adjusted_pnl = pnl_usd / atr_usd
 
         self.peak_equity = max(self.peak_equity, equity_end)
@@ -418,9 +438,9 @@ class ForexTradingEnv(gym.Env):
         drawdown_penalty = -drawdown * 5.0
 
         action_bonus = 0.0
-        if action in (1, 2) and self.position != 0:
+        if action not in (0, 1) and self.position != 0:
             action_bonus = 0.02
-        elif action == 3 and self.position == 0:
+        elif action == 1 and self.position == 0:
             action_bonus = 0.01
 
         shaping_usd = 0.0
@@ -429,7 +449,6 @@ class ForexTradingEnv(gym.Env):
 
         raw_reward = risk_adjusted_pnl + drawdown_penalty + action_bonus + (shaping_usd / atr_usd)
         reward = raw_reward * self.reward_scale
-        # ------------------------------------
 
         self.current_idx += 1
         self.next_idx += 1

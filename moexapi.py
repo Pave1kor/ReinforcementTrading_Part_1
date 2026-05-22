@@ -54,15 +54,15 @@ async def main():
     # Скачаем дневные свечи Сбербанка за 2023 год
     df_sber = await fetch_moex_candles(
         ticker='SBER',
-        start_date='2024-01-01',
+        start_date='2018-01-01',
         end_date='2025-12-31',
-        interval=10  # Дневные свечи
+        interval=10 
     )
     
     # Сохраняем в CSV
     if not df_sber.empty:
-        df_sber.to_csv('data/SBER_test_2023_daily.csv')
-        print("Данные сохранены в 'SBER_2023_daily.csv'")
+        df_sber.to_csv('data/SBER_2018_2025.csv')
+        print("Данные сохранены в 'SBER_2018_2025.csv'")
         print(df_sber.head())
 
 # Запуск асинхронной функции
