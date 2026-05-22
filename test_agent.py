@@ -1,5 +1,5 @@
+# -*- coding: utf-8 -*-
 import os
-import json
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
@@ -46,7 +46,18 @@ def compute_full_metrics(equity_curve, trades_df=None, initial_equity=100000.0):
     }
 
     if trades_df is not None and len(trades_df) > 0:
-        dollar_pnl = trades_df['net_pips'] * trades_df['lot_size'] * 0.01
+        # Расчёт PnL по формуле (exit_price - entry_price) * lot_size * sign
+        pnl_list = []
+        for i, row in trades_df.iterrows():
+            if row['position'] == 1:
+                pnl = (row['exit_price'] - row['entry_price']) * row['lot_size']
+            else:
+                pnl = (row['entry_price'] - row['exit_price']) * row['lot_size']
+            commission_open = row['entry_price'] * row['lot_size'] * 0.003
+            commission_close = row['exit_price'] * row['lot_size'] * 0.003
+            pnl -= (commission_open + commission_close)
+            pnl_list.append(pnl)
+        dollar_pnl = np.array(pnl_list)
         gains = dollar_pnl[dollar_pnl > 0].sum()
         losses = abs(dollar_pnl[dollar_pnl < 0].sum())
         profit_factor = gains / losses if losses > 0 else np.inf
@@ -54,6 +65,7 @@ def compute_full_metrics(equity_curve, trades_df=None, initial_equity=100000.0):
         avg_trade_usd = dollar_pnl.mean()
         n_days = len(full_equity) / 39
         turnover = len(trades_df) / n_days if n_days > 0 else 0.0
+
         metrics.update({
             "profit_factor": profit_factor,
             "win_rate": win_rate,
@@ -68,16 +80,12 @@ def run_one_episode(model, vec_env, deterministic=True):
     episode_starts = np.ones((vec_env.num_envs,), dtype=bool)
     equity_curve = []
     closed_trades = []
-
     while True:
-        action, lstm_states = model.predict(obs, state=lstm_states,
-                                            episode_start=episode_starts,
-                                            deterministic=deterministic)
-        obs, rewards, dones, infos = vec_env.step(action)
+        action, lstm_states = model.predict(obs, state=lstm_states, episode_start=episode_starts, deterministic=deterministic)
+        obs, _, dones, infos = vec_env.step(action)
         done = bool(dones[0])
         episode_starts = dones
         info = infos[0]
-
         equity_curve.append(float(info["equity_usd"]))
         trade_info = info.get("last_trade_info")
         if trade_info and trade_info.get("event") == "CLOSE":
@@ -88,51 +96,49 @@ def run_one_episode(model, vec_env, deterministic=True):
     return equity_curve, closed_trades
 
 def main():
-    TEST_DATA_PATH = "data/SBER_test_2023_daily.csv"
-    if not os.path.exists(TEST_DATA_PATH):
-        print("Тестовый файл не найден. Создайте data/SBER_test_2023_daily.csv")
-        return
-    if not os.path.exists("final_metadata.json"):
-        print("final_metadata.json не найден. Запустите train_agent_walkforward.py сначала.")
-        return
-
-    with open("final_metadata.json", "r") as f:
-        meta = json.load(f)
-    feature_cols = meta['feature_cols']
-    train_mean = np.array(meta['mean'])
-    train_std = np.array(meta['std'])
-
-    df_test, _ = load_and_preprocess_data(TEST_DATA_PATH)
-
+    DATA_PATH = "data/SBER_2018_2025.csv"
+    MODEL_PATH = "model_sber_final"
+    NORM_PATH = "vec_normalize_final.pkl"
     WIN = 60
+
+    df, feature_cols = load_and_preprocess_data(DATA_PATH)
+    split_idx = int(len(df) * 0.8)
+    train_df = df.iloc[:split_idx].copy()
+    test_df = df.iloc[split_idx:].copy()
+
+    train_features = train_df[feature_cols].values.astype(np.float32)
+    train_mean = np.mean(train_features, axis=0)
+    train_std = np.std(train_features, axis=0)
+
     test_env = ForexTradingEnv(
-        df=df_test, window_size=WIN, feature_columns=feature_cols,
-        spread_pips=1.0, commission_pips=0.0, max_slippage_pips=1.0,
+        df=test_df, window_size=WIN, feature_columns=feature_cols,
+        spread_pips=1.0, max_slippage_pips=1.0,
         random_start=False, episode_max_steps=None,
         feature_mean=train_mean, feature_std=train_std,
-        risk_per_trade=0.005, base_sl_pips=40.0, base_tp_pips=80.0,
-        k_sl=0.3, k_tp=0.6, open_penalty_pips=0.0, time_penalty_pips=0.0005,
-        trailing_atr_mult=2.0, min_atr_pips=5.0, slope_div_reward_scale=0.002,
-        open_bonus_pips=5.0, reward_scale=0.002, pip_value=0.01, lot_size=1.0, leverage=1.0
+        risk_per_trade=0.005, commission_percent=0.003,
+        sl_percent=0.01, tp_percents=[0.01, 0.02, 0.04, 0.06, 0.08],
+        open_penalty_pips=0.0, time_penalty_pips=0.0,
+        slope_div_reward_scale=0.001, open_bonus_pips=0.0,
+        reward_scale=0.01, pip_value=0.01, lot_size=1.0, leverage=1.0
     )
 
     vec_env = DummyVecEnv([lambda: test_env])
-    if os.path.exists("vec_normalize_final.pkl"):
-        vec_env = VecNormalize.load("vec_normalize_final.pkl", vec_env)
+    if os.path.exists(NORM_PATH):
+        vec_env = VecNormalize.load(NORM_PATH, vec_env)
         vec_env.training = False
         vec_env.norm_reward = False
     else:
         vec_env = VecNormalize(vec_env, norm_obs=True, norm_reward=False, training=False)
 
-    model = RecurrentPPO.load("model_sber_final", env=vec_env)
+    model = RecurrentPPO.load(MODEL_PATH, env=vec_env)
 
     equity_curve, closed_trades = run_one_episode(model, vec_env, deterministic=True)
 
     trades_df = pd.DataFrame(closed_trades) if closed_trades else None
     metrics = compute_full_metrics(equity_curve, trades_df=trades_df, initial_equity=100000.0)
 
-    print("========== РЕЗУЛЬТАТЫ ТЕСТИРОВАНИЯ НА 2024-2025 ==========")
-    print(f"Период: {df_test.index[0]} – {df_test.index[-1]}")
+    print("========== РЕЗУЛЬТАТЫ ТЕСТИРОВАНИЯ ==========")
+    print(f"Период: {test_df.index[0]} – {test_df.index[-1]}")
     print(f"Финальная эквити: {metrics['final_equity']:.2f} RUB")
     print(f"Общая доходность: {metrics['total_return_pct']:.2f}%")
     print(f"Коэффициент Шарпа (годовой): {metrics['sharpe_ratio']:.3f}")
@@ -159,8 +165,7 @@ def main():
     plt.legend()
     textstr = f"Sharpe: {metrics['sharpe_ratio']:.2f}\nSortino: {metrics['sortino_ratio']:.2f}\nMax DD: {metrics['max_drawdown_pct']:.1f}%\nCalmar: {metrics['calmar_ratio']:.2f}"
     props = dict(boxstyle='round', facecolor='wheat', alpha=0.5)
-    plt.gca().text(0.02, 0.98, textstr, transform=plt.gca().transAxes, fontsize=10,
-                   verticalalignment='top', bbox=props)
+    plt.gca().text(0.02, 0.98, textstr, transform=plt.gca().transAxes, fontsize=10, verticalalignment='top', bbox=props)
     plt.tight_layout()
     plt.savefig("test_equity_curve_final.png")
     plt.show()

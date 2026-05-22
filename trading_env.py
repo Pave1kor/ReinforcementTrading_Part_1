@@ -20,27 +20,23 @@ class ForexTradingEnv(gym.Env):
         feature_columns=None,
         pip_value: float = 0.01,
         spread_pips: float = 1.0,
-        commission_pips: float = 0.0,
         max_slippage_pips: float = 1.0,
         lot_size: float = 1.0,
         risk_per_trade: float = 0.005,
         leverage: float = 1.0,
-        reward_scale: float = 0.002,
+        reward_scale: float = 0.005,          # увеличено с 0.002
+        commission_percent: float = 0.003,
         random_start: bool = True,
         min_episode_steps: int = 300,
         episode_max_steps: int | None = None,
         feature_mean: np.ndarray | None = None,
         feature_std: np.ndarray | None = None,
-        base_sl_pips: float = 40.0,
-        base_tp_pips: float = 80.0,
-        k_sl: float = 0.3,
-        k_tp: float = 0.6,
+        sl_percent: float = 0.01,
+        tp_percents: list = [0.01, 0.02, 0.04, 0.06, 0.08],
         open_penalty_pips: float = 0.0,
-        time_penalty_pips: float = 0.0005,
-        trailing_atr_mult: float = 2.0,
-        min_atr_pips: float = 5.0,
-        slope_div_reward_scale: float = 0.002,
-        open_bonus_pips: float = 5.0,
+        time_penalty_pips: float = 0.0,       # временно отключён
+        slope_div_reward_scale: float = 0.001, # уменьшено
+        open_bonus_pips: float = 0.0,          # отключён
     ):
         super().__init__()
         self.df = df.reset_index(drop=True)
@@ -50,16 +46,14 @@ class ForexTradingEnv(gym.Env):
         self.window_size = int(window_size)
         self.pip_value = float(pip_value)
         self.spread_pips = float(spread_pips)
-        self.commission_pips = float(commission_pips)
         self.max_slippage_pips = float(max_slippage_pips)
         self.lot_size = float(lot_size)
         self.risk_per_trade = float(risk_per_trade)
         self.leverage = float(leverage)
         self.reward_scale = float(reward_scale)
+        self.commission_percent = float(commission_percent)
         self.open_penalty_pips = float(open_penalty_pips)
         self.time_penalty_pips = float(time_penalty_pips)
-        self.trailing_atr_mult = float(trailing_atr_mult)
-        self.min_atr_pips = float(min_atr_pips)
         self.slope_div_reward_scale = float(slope_div_reward_scale)
         self.open_bonus_pips = float(open_bonus_pips)
         self.random_start = bool(random_start)
@@ -68,12 +62,9 @@ class ForexTradingEnv(gym.Env):
         self.feature_mean = feature_mean
         self.feature_std = feature_std
 
-        self.base_sl_pips = base_sl_pips
-        self.base_tp_pips = base_tp_pips
-        self.k_sl = k_sl
-        self.k_tp = k_tp
+        self.sl_percent = sl_percent
+        self.tp_percents = tp_percents
 
-        # Действия: 0=HOLD, 1=CLOSE, 2-6=LONG_lot1-5, 7-11=SHORT_lot1-5
         self.action_space = spaces.Discrete(12)
 
         self.base_num_features = len(self.feature_columns)
@@ -166,56 +157,20 @@ class ForexTradingEnv(gym.Env):
             return 0.0
         return np.random.uniform(0.0, self.max_slippage_pips)
 
-    def _cost_pips_round_trip(self):
-        return self.spread_pips + self.commission_pips
-
-    def _compute_sl_tp(self, direction, slope_val, atr_pips, reference_atr=15.0):
-        base_sl = self.base_sl_pips
-        base_tp = self.base_tp_pips
-        vol_factor = atr_pips / reference_atr
-        vol_factor = np.clip(vol_factor, 0.5, 2.0)
-        abs_slope = min(abs(slope_val), 1.0)
-        sl_mult = 1 + self.k_sl * abs_slope
-        tp_mult = 1 + self.k_tp * abs_slope
-        sl_pips = base_sl * sl_mult * vol_factor
-        tp_pips = base_tp * tp_mult * vol_factor
-        sl_pips = np.clip(sl_pips, 5.0, 100.0)
-        tp_pips = max(tp_pips, sl_pips * 1.2)
-        return sl_pips, tp_pips
-
-    def _check_margin(self, lot_size, entry_price):
-        required_margin = (lot_size * entry_price) / self.leverage
-        return self._get_current_equity() > required_margin * 1.05
+    def _cost_commission_rub(self, price, lot_size):
+        return price * lot_size * self.commission_percent
 
     def _open_position(self, direction: int, bar, lot_multiplier: int = 1):
         if self.position != 0:
             return False
 
         entry_base_price = float(bar["Open"])
-        current_atr = float(bar["alma_atr"]) / self.pip_value
-        if current_atr <= 1e-6:
-            current_atr = 15.0
-        if current_atr < self.min_atr_pips:
-            return False
+        sl_abs = entry_base_price * self.sl_percent
+        tp_percent = self.tp_percents[lot_multiplier - 1]
+        tp_abs = entry_base_price * tp_percent
 
-        slope_val = float(bar["slope_div"])
-        sl_pips, tp_pips = self._compute_sl_tp(direction, slope_val, current_atr)
-
-        # ===== ДИНАМИЧЕСКАЯ КОРРЕКТИРОВКА SL/TP В ЗАВИСИМОСТИ ОТ ЛОТА =====
-        if lot_multiplier == 1:
-            # Консервативная сделка: короткий стоп и тейк
-            sl_pips = min(sl_pips, 30.0)
-            tp_pips = min(tp_pips, 45.0)
-        elif lot_multiplier in (4, 5):
-            # Агрессивная сделка: широкий стоп и дальний тейк
-            sl_pips = max(sl_pips, 60.0)
-            tp_pips = max(tp_pips, 150.0)
-        # для лотов 2 и 3 – оставляем рассчитанные значения
-        # ==============================================================
-
-        # Расчёт размера позиции с учётом множителя лота
         risk_amount = self._get_current_equity() * self.risk_per_trade * lot_multiplier
-        lot_size = risk_amount / (sl_pips * self.pip_value)
+        lot_size = risk_amount / sl_abs
         lot_size = np.clip(lot_size, 1.0, 5000.0)
         max_lot_by_margin = (self._get_current_equity() * self.leverage) / (entry_base_price * 1.2)
         lot_size = min(lot_size, max_lot_by_margin)
@@ -225,7 +180,8 @@ class ForexTradingEnv(gym.Env):
             return False
         self.usd_per_pip = self.pip_value * lot_size
 
-        if not self._check_margin(lot_size, entry_base_price):
+        required_margin = (lot_size * entry_base_price) / self.leverage
+        if self._get_current_equity() <= required_margin * 1.05:
             return False
 
         slip_pips = self._sample_slippage_pips()
@@ -236,23 +192,26 @@ class ForexTradingEnv(gym.Env):
             high = float(bar["High"])
             low = float(bar["Low"])
             entry = np.clip(entry, low, high)
-            sl_price = entry - sl_pips * self.pip_value
-            tp_price = entry + tp_pips * self.pip_value
+            sl_price = entry - sl_abs
+            tp_price = entry + tp_abs
             self.position = 1
         else:
             entry = entry_base_price - slip_price
             high = float(bar["High"])
             low = float(bar["Low"])
             entry = np.clip(entry, low, high)
-            sl_price = entry + sl_pips * self.pip_value
-            tp_price = entry - tp_pips * self.pip_value
+            sl_price = entry + sl_abs
+            tp_price = entry - tp_abs
             self.position = -1
+
+        commission_rub = self._cost_commission_rub(entry, lot_size)
+        self.equity_usd -= commission_rub
 
         self.entry_price = entry
         self.sl_price = sl_price
         self.tp_price = tp_price
         self.time_in_trade = 0
-        self.entry_slope = slope_val
+        self.entry_slope = float(bar["slope_div"])
         self.last_lot_multiplier = lot_multiplier
         self.last_trade_info = {
             "event": "OPEN",
@@ -261,17 +220,16 @@ class ForexTradingEnv(gym.Env):
             "entry_price": self.entry_price,
             "sl_price": self.sl_price,
             "tp_price": self.tp_price,
-            "slope_div": slope_val,
-            "atr_pips": current_atr,
+            "slope_div": self.entry_slope,
             "lot_size": lot_size,
             "lot_multiplier": lot_multiplier,
-            "sl_pips": sl_pips,
-            "tp_pips": tp_pips
+            "tp_percent": tp_percent * 100,
+            "commission_rub": commission_rub
         }
-        penalty_usd = self.open_penalty_pips * self.usd_per_pip
-        if penalty_usd > 0:
-            self.equity_usd -= penalty_usd
-        if self.open_bonus_pips > 0 and slope_val < 0:
+
+        if self.open_penalty_pips > 0:
+            self.equity_usd -= self.open_penalty_pips * self.usd_per_pip
+        if self.open_bonus_pips > 0 and self.entry_slope < 0:
             self.equity_usd += self.open_bonus_pips * self.usd_per_pip
         return True
 
@@ -281,9 +239,10 @@ class ForexTradingEnv(gym.Env):
         else:
             pnl_price = self.entry_price - exit_price
         realized_pips = pnl_price / self.pip_value
-        cost_pips = self._cost_pips_round_trip()
+        cost_pips = self.spread_pips
         net_pips = realized_pips - cost_pips
         self.equity_usd += net_pips * self.usd_per_pip
+
         trade_info = {
             "event": "CLOSE",
             "reason": reason,
@@ -295,7 +254,9 @@ class ForexTradingEnv(gym.Env):
             "net_pips": net_pips,
             "equity_usd": self._get_current_equity(),
             "time_in_trade": self.time_in_trade,
-            "lot_size": self.usd_per_pip / self.pip_value
+            "lot_size": self.usd_per_pip / self.pip_value,
+            "tp_reached": (reason == "TP_HIT"),
+            "sl_reached": (reason == "SL_HIT")
         }
         self.position = 0
         self.entry_price = None
@@ -311,23 +272,13 @@ class ForexTradingEnv(gym.Env):
             return None
         high = float(bar["High"])
         low = float(bar["Low"])
-        current_atr = float(bar["alma_atr"]) / self.pip_value
-        trailing_trigger = current_atr * self.trailing_atr_mult
 
         if self.position == 1:
-            if high >= self.entry_price + trailing_trigger * self.pip_value:
-                new_sl = self.entry_price
-                if new_sl > self.sl_price:
-                    self.sl_price = new_sl
             if high >= self.tp_price:
                 return self._close_position("TP_HIT", self.tp_price)
             if low <= self.sl_price:
                 return self._close_position("SL_HIT", self.sl_price)
         else:
-            if low <= self.entry_price - trailing_trigger * self.pip_value:
-                new_sl = self.entry_price
-                if new_sl < self.sl_price:
-                    self.sl_price = new_sl
             if low <= self.tp_price:
                 return self._close_position("TP_HIT", self.tp_price)
             if high >= self.sl_price:
@@ -340,9 +291,9 @@ class ForexTradingEnv(gym.Env):
         bull = bar["bull_div"] == 1
         bear = bar["bear_div"] == 1
         slope_div = bar["slope_div"]
-        if self.position == 1 and bear and slope_div < -0.3:
+        if self.position == 1 and bear and slope_div < -0.5:
             return "BEAR_DIV"
-        if self.position == -1 and bull and slope_div < -0.3:
+        if self.position == -1 and bull and slope_div < -0.5:
             return "BULL_DIV"
         return None
 
@@ -397,24 +348,24 @@ class ForexTradingEnv(gym.Env):
             self._close_position(self.pending_close_reason, next_bar["Open"])
             self.pending_close_reason = None
 
-        # Декодируем действие
         if action == 0:
-            pass   # HOLD
+            pass
         elif action == 1:
             if self.position != 0:
                 self._close_position("MANUAL_CLOSE", next_bar["Open"])
         elif 2 <= action <= 6:
             if self.position == 0:
-                lot_mult = action - 1   # 2→1, 3→2, ..., 6→5
+                lot_mult = action - 1
                 self._open_position(1, next_bar, lot_mult)
         elif 7 <= action <= 11:
             if self.position == 0:
-                lot_mult = action - 6   # 7→1, ..., 11→5
+                lot_mult = action - 6
                 self._open_position(-1, next_bar, lot_mult)
 
         if self.position != 0:
             self.time_in_trade += 1
-            self.equity_usd -= self.time_penalty_pips * self.usd_per_pip
+            if self.time_penalty_pips > 0:
+                self.equity_usd -= self.time_penalty_pips * self.usd_per_pip
 
         if self.position != 0:
             self._check_sl_tp_intrabar(next_bar)
@@ -426,29 +377,19 @@ class ForexTradingEnv(gym.Env):
 
         equity_end = self._get_equity_at_price(next_bar["Close"])
 
-        # Награда
+        # ========== УПРОЩЁННАЯ НАГРАДА ==========
         pnl_usd = equity_end - equity_start
         atr_pips = curr_bar["alma_atr"] / self.pip_value
         atr_usd = atr_pips * self.usd_per_pip if self.usd_per_pip > 0 else 1.0
         atr_usd = max(atr_usd, 1.0)
-        risk_adjusted_pnl = pnl_usd / atr_usd
-
-        self.peak_equity = max(self.peak_equity, equity_end)
-        drawdown = (self.peak_equity - equity_end) / self.peak_equity if self.peak_equity > 0 else 0
-        drawdown_penalty = -drawdown * 5.0
-
-        action_bonus = 0.0
-        if action not in (0, 1) and self.position != 0:
-            action_bonus = 0.02
-        elif action == 1 and self.position == 0:
-            action_bonus = 0.01
-
-        shaping_usd = 0.0
+        raw_reward = pnl_usd / atr_usd   # только риск-скорректированный PnL
+        # Дополнительно: небольшой shaping через slope_div (опционально)
+        shaping = 0.0
         if self.position != 0:
-            shaping_usd = -curr_bar["slope_div"] * self.slope_div_reward_scale * self.usd_per_pip
-
-        raw_reward = risk_adjusted_pnl + drawdown_penalty + action_bonus + (shaping_usd / atr_usd)
+            shaping = -curr_bar["slope_div"] * self.slope_div_reward_scale * self.usd_per_pip / atr_usd
+        raw_reward += shaping
         reward = raw_reward * self.reward_scale
+        # ======================================
 
         self.current_idx += 1
         self.next_idx += 1
