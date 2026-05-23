@@ -1,228 +1,219 @@
 import os
+import yaml
+import json
 import numpy as np
-import matplotlib.pyplot as plt
 import pandas as pd
-
+import matplotlib.pyplot as plt
+import torch.nn as nn
 from sb3_contrib import RecurrentPPO
-from stable_baselines3.common.vec_env import DummyVecEnv, SubprocVecEnv
-from stable_baselines3.common.callbacks import CheckpointCallback
+from stable_baselines3.common.vec_env import VecNormalize, DummyVecEnv, SubprocVecEnv
+from stable_baselines3.common.callbacks import CheckpointCallback, EvalCallback
 
 from indicators import load_and_preprocess_data
 from trading_env import ForexTradingEnv
+from utils import make_stationary, purged_walk_forward_splits, compute_rolling_metrics
 
+def load_config(config_path="config.yaml"):
+    with open(config_path, 'r') as f:
+        config = yaml.safe_load(f)
+    return config
 
-def evaluate_model(model: RecurrentPPO, eval_env: DummyVecEnv, deterministic: bool = True):
-    # Это автоматически перестроит размерность скрытых состояний LSTM под num_envs = 1.
-    model.set_env(eval_env, force_reset=False)
+def make_env(df, config, feature_cols, mean=None, std=None, random_start=True, episode_max_steps=None):
+    return ForexTradingEnv(
+        df=df,
+        window_size=config['data']['window_size'],
+        feature_columns=feature_cols,
+        spread_pips=config['environment']['spread_pips'],
+        max_slippage_pips=config['environment']['max_slippage_pips'],
+        risk_per_trade=config['environment']['risk_per_trade'],
+        leverage=config['environment']['leverage'],
+        commission_percent=config['environment']['commission_percent'],
+        use_atr_sl=config['environment']['use_atr_sl'],
+        atr_multiplier_sl=config['environment']['atr_multiplier_sl'],
+        atr_multiplier_tp=config['environment']['atr_multiplier_tp'],
+        partial_close_enabled=config['environment']['partial_close_enabled'],
+        partial_close_ratio=config['environment']['partial_close_ratio'],
+        tp_levels=config['environment']['tp_levels'],
+        fixed_sl_percent=config['environment']['fixed_sl_percent'],
+        fixed_tp_percents=config['environment']['fixed_tp_percents'],
+        open_penalty_pips=config['environment']['reward']['open_penalty_pips'],
+        time_penalty_pips=config['environment']['reward']['time_penalty_pips'],
+        slope_div_reward_scale=config['environment']['reward']['slope_div_reward_scale'],
+        reward_scale=config['environment']['reward']['reward_scale'],
+        open_bonus_pips=0.0,
+        random_start=random_start,
+        min_episode_steps=config['training']['min_episode_steps'],
+        episode_max_steps=episode_max_steps or config['training']['episode_max_steps'],
+        feature_mean=mean,
+        feature_std=std,
+        pip_value=config['data']['pip_value']
+    )
+
+def evaluate_model(model, eval_env, deterministic=True):
     obs = eval_env.reset()
-    equity_curve = []
-
     lstm_states = None
     episode_starts = np.ones((eval_env.num_envs,), dtype=bool)
-
+    equity_curve = []
     while True:
-        action, lstm_states = model.predict(
-            obs, 
-            state=lstm_states, 
-            episode_start=episode_starts, 
-            deterministic=deterministic
-        )
-
-        obs, rewards, dones, infos = eval_env.step(action)
-        done = bool(dones[0])
-
-        # Передаем реальный статус завершения на следующий шаг для LSTM
+        action, lstm_states = model.predict(obs, state=lstm_states, episode_start=episode_starts, deterministic=deterministic)
+        obs, _, dones, infos = eval_env.step(action)
         episode_starts = dones
-
-        # Извлекаем словарь info для единственной среды в векторе
-        info = infos[0]
-
-        if done:
-            # Если это последний шаг, вытаскиваем финальное эквити из словаря info
-            if isinstance(info, dict) and "equity_usd" in info:
-                equity_curve.append(float(info["equity_usd"]))
-            elif isinstance(info, dict) and "terminal_observation" in info and "equity_usd" in info["terminal_observation"]:
-                equity_curve.append(float(info["terminal_observation"]["equity_usd"]))
-            else:
-                if equity_curve:
-                    equity_curve.append(equity_curve[-1])
-            break # Мгновенно выходим из цикла
-        else:
-            # Если эпизод продолжается, берем текущее эквити из ЖИВОЙ среды eval_env
-            equity_curve.append(float(eval_env.get_attr("equity_usd")[0]))
-
-    final_equity = float(equity_curve[-1])
-    return equity_curve, final_equity
-
-
+        equity_curve.append(float(infos[0]["equity_usd"]))
+        if dones[0]:
+            break
+    return equity_curve, equity_curve[-1]
 
 def main():
-    #file_path = "data/EURUSD_15 Mins_Ask_2020.12.06_2025.12.12.csv"
-    file_path = "data/test_EURUSD_Candlestick_1_Hour_BID_20.02.2023-22.02.2025.csv"
-    df, feature_cols = load_and_preprocess_data(file_path)
-
-    split_idx = int(len(df) * 0.8)
-    train_df = df.iloc[:split_idx].copy()
-    test_df = df.iloc[split_idx:].copy()
-
-    print("Training bars:", len(train_df))
-    print("Testing bars :", len(test_df))
-
-    # Извлекаем признаки для расчета параметров нормализации (БЕЗ учета таргетов/цен, если нужно)
-    # Считаем среднее и дисперсию СТРОГО на обучающей выборке (Защита от Data Leakage)
-    train_features_df = train_df[feature_cols].apply(pd.to_numeric, errors='coerce').fillna(0.0)
-    train_features = train_features_df.values.astype(np.float32)
-    train_mean = np.mean(train_features, axis=0)
-    train_std = np.std(train_features, axis=0)
-
-    # ---- Env factories ----
-    SL_OPTS = [1.0, 1.5]
-    TP_OPTS = [2.0, 3.5]
-    WIN = 60
-    NUM_ENVS = 4  # Задействуем 4 параллельных потока (FPS вырастет до 160-200+)
+    config = load_config()
     
-    # Train env: random starts to reduce memorization
-    def make_train_env():
-        return ForexTradingEnv(
-            df=train_df,
-            window_size=WIN,
-            sl_options=SL_OPTS,
-            tp_options=TP_OPTS,
-            spread_pips=1.0,
-            commission_pips=0.0,
-            max_slippage_pips=0.5,
-            random_start=True,
-            min_episode_steps=300,
-            episode_max_steps=800,
-            feature_mean=train_mean, 
-            feature_std=train_std,    
-            feature_columns=feature_cols,
-            open_penalty_pips=0.1,      # 0.5 half a pip per open
-            time_penalty_pips=0.005,     # 0.02 pips per bar in trade
-        )
-
-    # Train-eval env: deterministic start, NO random starts (so curve is stable/reproducible)
-    def make_train_eval_env():
-        return ForexTradingEnv(
-            df=train_df,
-            window_size=WIN,
-            sl_options=SL_OPTS,
-            tp_options=TP_OPTS,
-            spread_pips=1.0,
-            commission_pips=0.0,
-            max_slippage_pips=0.5,
-            random_start=False,
-            episode_max_steps=None,
-            feature_mean=train_mean,
-            feature_std=train_std,
-            feature_columns=feature_cols,
-            open_penalty_pips=0.1,      # half a pip per open
-            time_penalty_pips=0.005,     # 0.02 pips per bar in trade
-        )
-
-    # Test-eval env: deterministic
-    def make_test_eval_env():
-        return ForexTradingEnv(
-            df=test_df,
-            window_size=WIN,
-            sl_options=SL_OPTS,
-            tp_options=TP_OPTS,
-            spread_pips=1.0,
-            commission_pips=0.0,
-            max_slippage_pips=0.5,
-            random_start=False,
-            episode_max_steps=None,
-            feature_std=train_std,
-            feature_mean=train_mean, 
-            feature_columns=feature_cols,
-            open_penalty_pips=0.1,      # half a pip per open
-            time_penalty_pips=0.005,     # 0.02 pips per bar in trade
-        )
-
-    train_vec_env = SubprocVecEnv([lambda i=i: make_train_env() for i in range(NUM_ENVS)])
-    train_eval_env = DummyVecEnv([make_train_eval_env])
-    test_eval_env = DummyVecEnv([make_test_eval_env])
-
-    policy_kwargs = dict(
-        net_arch=dict(
-            shared=[64],
-            pi=[32], 
-            vf=[32]
-        ),
-        lstm_hidden_size=48,
-        n_lstm_layers=1
-    )
-
-
-    # ---- Model ----
-    model = RecurrentPPO(
-        policy="MlpLstmPolicy",
-        env=train_vec_env,
-        verbose=1,
-        tensorboard_log="./tensorboard_log/",
-        policy_kwargs=policy_kwargs,
-        ent_coef=0.02,
-        learning_rate=1e-4,
-        n_steps= 1024,
-        batch_size=256,
-        n_epochs=4,
-        gamma=0.99,
-        gae_lambda=0.95,
-        clip_range=0.1,
-        vf_coef=0.5
-    )
-
-    # ---- Checkpoints ----
-    ckpt_dir = "./checkpoints"
-    os.makedirs(ckpt_dir, exist_ok=True)
-
-    CKPT_PREFIX = "RecurrentPPO_eurusd"
-    checkpoint_callback = CheckpointCallback(
-        save_freq=50_000,
-        save_path=ckpt_dir,
-        name_prefix=CKPT_PREFIX
-    )
-
-    # ---- Train ----
-    total_timesteps = 500000
-    model.learn(total_timesteps=total_timesteps, callback=checkpoint_callback)
-
-    # ---- Select best model by OOS final equity ----
-    model.save("model_eurusd_best")
-    print("Model saved: model_eurusd_best")
-
-    # ---- Plot BOTH: in-sample vs out-of-sample ----
-    plot_model_train = RecurrentPPO.load("model_eurusd_best", env=train_eval_env)
-    equity_curve_train, final_equity_train = evaluate_model(plot_model_train, train_eval_env)
+    # Загрузка данных
+    df_full, feature_cols = load_and_preprocess_data(config['data']['path'])
     
-    plot_model_test = RecurrentPPO.load("model_eurusd_best", env=test_eval_env)
-    equity_curve_test, final_equity_test = evaluate_model(plot_model_test, test_eval_env)
-
-
-    print(f"[IS Eval]  Final equity (train): {final_equity_train:.2f}")
-    print(f"[OOS Eval] Final equity (test) : {final_equity_test:.2f}")
-
-    plt.figure(figsize=(12, 6))
-    plt.plot(equity_curve_train, label=f"Train (in-sample) equity: {final_equity_train:.2f}$")
-    plt.title("Train (In-Sample) Equity Curve - Best Model")
-    plt.xlabel("Steps")
-    plt.ylabel("Equity ($)")
-    plt.legend()
-    plt.grid(True, alpha=0.3)
-    plt.tight_layout()
-    plt.savefig("model1_train_clean.png")
-
-    plt.figure(figsize=(12, 6))
-    plt.plot(equity_curve_test, label=f"Test (out-of-sample) equity: {final_equity_test:.2f}$", color="orange")
-    plt.title("Test (Out-of-Sample) Equity Curve - Best Model")
-    plt.xlabel("Steps")
-    plt.ylabel("Equity ($)")
-    plt.legend()
-    plt.grid(True, alpha=0.3)
-    plt.tight_layout()
-    plt.savefig("model1_test_clean.png")
-
-
+    # Проверка стационарности и дифференцирование признаков
+    print("Проверка стационарности признаков...")
+    df_full = make_stationary(df_full, feature_cols, threshold=0.05)
+    
+    # Purged Walk-Forward сплиты
+    splits = purged_walk_forward_splits(df_full, config['training']['val_years'], config['training']['purge_days'])
+    print(f"Создано {len(splits)} окон Walk-Forward")
+    
+    all_results = []
+    
+    for split in splits:
+        print(f"\n===== Окно: {split['name']} =====")
+        train_df = df_full.loc[split['train_idx']]
+        val_df = df_full.loc[split['val_idx']]
+        test_df = df_full.loc[split['test_idx']]
+        
+        # Нормализация на обучающем окне
+        train_features = train_df[feature_cols].values.astype(np.float32)
+        train_mean = np.mean(train_features, axis=0)
+        train_std = np.std(train_features, axis=0)
+        
+        # Создание сред
+        def make_train_env():
+            return make_env(train_df, config, feature_cols, train_mean, train_std,
+                           random_start=True, episode_max_steps=config['training']['episode_max_steps'])
+        
+        def make_eval_env(df, mean, std):
+            return make_env(df, config, feature_cols, mean, std,
+                           random_start=False, episode_max_steps=None)
+        
+        train_vec_env = SubprocVecEnv([lambda i=i: make_train_env() for i in range(config['training']['num_envs'])])
+        train_vec_env = VecNormalize(train_vec_env, norm_obs=True, norm_reward=False, clip_obs=10.0, gamma=0.99)
+        
+        val_env = DummyVecEnv([lambda: make_eval_env(val_df, train_mean, train_std)])
+        val_env = VecNormalize(val_env, norm_obs=True, norm_reward=False, training=False)
+        
+        # Callback для расчёта метрик на валидации
+        class MetricsEvalCallback(EvalCallback):
+            def __init__(self, *args, **kwargs):
+                super().__init__(*args, **kwargs)
+                self.best_sharpe = -np.inf
+                
+            def _on_step(self):
+                ret = super()._on_step()
+                if self.eval_freq > 0 and self.n_calls % self.eval_freq == 0:
+                    equity_curve, _ = evaluate_model(self.model, self.eval_env, deterministic=True)
+                    metrics = compute_rolling_metrics(equity_curve)
+                    sharpe = metrics['sharpe']
+                    if sharpe > self.best_sharpe:
+                        self.best_sharpe = sharpe
+                        self.model.save(f"best_sharpe_{self.eval_env.get_attr('window_size')[0]}")
+                    print(f"Val Metrics: Sharpe={sharpe:.3f}, MaxDD={metrics['max_dd']*100:.2f}%, Calmar={metrics['calmar']:.3f}")
+                return ret
+        
+        policy_kwargs = dict(
+            net_arch=dict(shared=config['training']['policy']['net_arch_shared'],
+                          pi=config['training']['policy']['net_arch_pi'],
+                          vf=config['training']['policy']['net_arch_vf']),
+            lstm_hidden_size=config['training']['policy']['lstm_hidden_size'],
+            n_lstm_layers=config['training']['policy']['n_lstm_layers'],
+            activation_fn=nn.Tanh
+        )
+        
+        model = RecurrentPPO(
+            policy="MlpLstmPolicy", env=train_vec_env, verbose=1,
+            tensorboard_log=f"./logs/{split['name']}",
+            policy_kwargs=policy_kwargs,
+            ent_coef=float(config['training']['ent_coef']),
+            learning_rate=float(config['training']['learning_rate']),
+            batch_size=config['training']['batch_size'],
+            n_epochs=config['training']['n_epochs'],
+            gamma=config['training']['gamma'],
+            gae_lambda=config['training']['gae_lambda'],
+            clip_range=config['training']['clip_range'],
+            vf_coef=config['training']['vf_coef'],
+            max_grad_norm=config['training']['max_grad_norm']
+        )
+        
+        os.makedirs(f"./checkpoints/{split['name']}", exist_ok=True)
+        checkpoint_callback = CheckpointCallback(save_freq=50_000, save_path=f"./checkpoints/{split['name']}")
+        eval_callback = MetricsEvalCallback(val_env, best_model_save_path=f"./best_{split['name']}",
+                                            log_path=f"./eval_log_{split['name']}", eval_freq=10_000,
+                                            deterministic=True, render=False)
+        
+        model.learn(total_timesteps=config['training']['total_timesteps'], callback=[checkpoint_callback, eval_callback])
+        model.save(f"model_{split['name']}")
+        train_vec_env.save(f"vec_normalize_{split['name']}.pkl")
+        
+        # Тест на внутреннем окне
+        test_env = DummyVecEnv([lambda: make_eval_env(test_df, train_mean, train_std)])
+        test_env = VecNormalize.load(f"vec_normalize_{split['name']}.pkl", test_env)
+        test_env.training = False
+        test_env.norm_reward = False
+        
+        test_curve, test_final = evaluate_model(model, test_env)
+        metrics = compute_rolling_metrics(test_curve)
+        print(f"Inner test {split['name']}: final equity = {test_final:.2f}, Sharpe = {metrics['sharpe']:.3f}, MaxDD = {metrics['max_dd']*100:.2f}%")
+        all_results.append({'window': split['name'], **metrics})
+    
+    with open("walkforward_results.json", "w") as f:
+        json.dump(all_results, f, indent=2)
+    
+    print("\n===== Финальное обучение на всех данных до 2024 =====")
+    final_train_df = df_full[df_full.index < pd.Timestamp("2024-01-01")]
+    final_train_features = final_train_df[feature_cols].values.astype(np.float32)
+    final_mean = np.mean(final_train_features, axis=0)
+    final_std = np.std(final_train_features, axis=0)
+    
+    def make_final_train_env():
+        return make_env(final_train_df, config, feature_cols, final_mean, final_std,
+                       random_start=True, episode_max_steps=config['training']['episode_max_steps'])
+    
+    final_train_vec_env = SubprocVecEnv([lambda i=i: make_final_train_env() for i in range(config['training']['num_envs'])])
+    final_train_vec_env = VecNormalize(final_train_vec_env, norm_obs=True, norm_reward=False, clip_obs=10.0, gamma=0.99)
+    
+    final_model = RecurrentPPO(
+        policy="MlpLstmPolicy", env=final_train_vec_env, verbose=1,
+        tensorboard_log="./logs/final", policy_kwargs=policy_kwargs,
+        ent_coef=config['training']['ent_coef'],
+        learning_rate=config['training']['learning_rate'],
+        n_steps=config['training']['n_steps'],
+        batch_size=config['training']['batch_size'],
+        n_epochs=config['training']['n_epochs'],
+        gamma=config['training']['gamma'],
+        gae_lambda=config['training']['gae_lambda'],
+        clip_range=config['training']['clip_range'],
+        vf_coef=config['training']['vf_coef'],
+        max_grad_norm=config['training']['max_grad_norm']
+    )
+    final_model.learn(total_timesteps=config['training']['total_timesteps'] * 2)  # финальное обучение дольше
+    final_model.save("model_sber_final")
+    final_train_vec_env.save("vec_normalize_final.pkl")
+    
+    # Сохраняем метаданные
+    with open("final_metadata.json", "w") as f:
+        json.dump({
+            'mean': final_mean.tolist(),
+            'std': final_std.tolist(),
+            'feature_cols': feature_cols,
+            'train_start': str(final_train_df.index.min()),
+            'train_end': str(final_train_df.index.max()),
+            'config': config
+        }, f)
+    
+    print("Обучение завершено.")
 
 if __name__ == "__main__":
     main()

@@ -2,126 +2,83 @@ import pandas as pd
 import numpy as np
 import pandas_ta as ta
 
-
 def load_and_preprocess_data(csv_path: str):
-    """
-    Loads EURUSD data from CSV and preprocesses it by adding RELATIVE technical features.
-
-    CSV expected columns: [Time (EET), Open, High, Low, Close, Volume]
-    The returned DataFrame still contains OHLCV for env internals,
-    but `feature_cols` lists only the RELATIVE columns to feed the agent.
-    """
-    df = pd.read_csv(
-        csv_path,
-        parse_dates=["Time (EET)"],
-        dayfirst=True,
-    )
-
-    # Strip any trailing spaces in headers (e.g. "Volume ")
+    df = pd.read_csv(csv_path, parse_dates=["begin"], dayfirst=True)
     df.columns = df.columns.str.strip()
-
-    # Datetime index
-    df = df.set_index("Time (EET)")
-    df.sort_index(inplace=True)
-
-    # Ensure numeric
+    df = df.set_index("begin").sort_index()
+    df.index = pd.to_datetime(df.index)
+    df = df.rename(columns={
+        'open': 'Open', 'high': 'High', 'low': 'Low', 'close': 'Close', 'volume': 'Volume'
+    })
     for col in ["Open", "High", "Low", "Close", "Volume"]:
         df[col] = pd.to_numeric(df[col], errors="coerce")
 
-# ---- Indicators ----
-
-# ----- Pressure -----
+    # Базовые производные
     df["pressure"] = (df["Close"] - df["Low"]) - (df["High"] - df["Close"])
     df["bar_range"] = df["High"] - df["Low"]
-    df["norm_pressure"] = np.where(
-        df["bar_range"] != 0, df["pressure"] / df["bar_range"], 0.0
-        )
-
-    # ----- Delta -----
+    df["norm_pressure"] = np.where(df["bar_range"] != 0, df["pressure"] / df["bar_range"], 0.0)
     df["delta"] = df["norm_pressure"] * df["Volume"]
 
-    # ----- Средние -----
+    # ALMA сглаживание (без look-ahead, использует только прошлые данные)
+    df["cvd_avg"] = ta.alma(df["delta"], length=50, sigma=0.85, distribution_offset=4)
+    df["price_avg"] = ta.alma(df["Close"], length=34, sigma=0.85, distribution_offset=4)
 
-    df["cvd_avg"] = ta.alma(
-        df["delta"], length=50, sigma=0.85, distribution_offset=4
-        )
-    df["price_avg"] = ta.alma(
-        df["Close"], length=34, sigma=0.85, distribution_offset=4
-    )
-
-    # ----- Наклоны (сырые) -----
-
-    cvd_linreg_curr = ta.linreg(df["cvd_avg"], length=8, offset=0).squeeze()
-    cvd_linreg_prev = ta.linreg(df["cvd_avg"], length=8, offset=1).squeeze()
+    # FIX: Наклоны без look-ahead – регрессия только по прошлым барам (исключая текущий)
+    # Используем shift(1) и shift(2), чтобы в момент t регрессия смотрела на бары t-8..t-1
+    cvd_linreg_curr = ta.linreg(df["cvd_avg"].shift(1), length=8)   # регрессия на t-7...t-1
+    cvd_linreg_prev = ta.linreg(df["cvd_avg"].shift(2), length=8)   # регрессия на t-8...t-2
     df["cvd_slope_raw"] = cvd_linreg_curr - cvd_linreg_prev
 
-    price_linreg_curr = ta.linreg(df["price_avg"], length=8, offset=0).squeeze()
-    price_linreg_prev = ta.linreg(df["price_avg"], length=8, offset=1).squeeze()
+    price_linreg_curr = ta.linreg(df["price_avg"].shift(1), length=8)
+    price_linreg_prev = ta.linreg(df["price_avg"].shift(2), length=8)
     df["price_slope_raw"] = price_linreg_curr - price_linreg_prev
 
-    # ----- Нормализация -----
-    tr_series = ta.true_range(
-        df["High"], df["Low"], df["Close"]
-        )
-    df["alma_atr"] = ta.alma(
-        tr_series, length=300, sigma=0.85, distribution_offset=4
-        )
-    df["alma_vol"] = ta.alma(
-        df["Volume"], length=300, sigma=0.85, distribution_offset=4
-        )
+    # ATR через ALMA
+    tr_series = ta.true_range(df["High"], df["Low"], df["Close"])
+    df["alma_atr"] = ta.alma(tr_series, length=300, sigma=0.85, distribution_offset=4)
+    df["alma_vol"] = ta.alma(df["Volume"], length=300, sigma=0.85, distribution_offset=4)
 
-    # 3. Нормирование (обработка деления на ноль через np.where)
-    df["price_slope"] = np.where(
-        df["alma_atr"] != 0, 
-        df["price_slope_raw"] / df["alma_atr"], 
-        df["price_slope_raw"]
-    )
+    # Нормированные наклоны
+    df["price_slope"] = np.where(df["alma_atr"] != 0, df["price_slope_raw"] / df["alma_atr"], df["price_slope_raw"])
+    df["cvd_slope"] = np.where(df["alma_vol"] != 0, df["cvd_slope_raw"] / df["alma_vol"], df["cvd_slope_raw"])
 
-    df["cvd_slope"] = np.where(
-        df["alma_vol"] != 0, 
-        df["cvd_slope_raw"] / df["alma_vol"], 
-        df["cvd_slope_raw"]
-    )
-
-    df["slope_div"]=df["price_slope"]*df["cvd_slope"]
-
-    df["bull_div"] = (df["price_slope"] < 0) & (df["cvd_slope"] > 0).astype(float)
-    df["bear_div"] = (df["price_slope"] > 0) & (df["cvd_slope"] < 0).astype(float)
-
-    # 1. RSI (уже ограничен от 0 до 100, делим на 100 для нормализации от 0.0 до 1.0)
-    df["rsi_norm"] = ta.rsi(df["Close"], length=14) / 100.0
-    
-    # 2. Положение цены внутри диапазона волатильности (аналог Bollinger Bands %B, но через ATR)
-    # Показывает, насколько цена отклонилась от своего среднего значения в масштабе текущей волатильности
-    df["price_dist_from_avg"] = np.where(
-        df["alma_atr"] != 0, 
-        (df["Close"] - df["price_avg"]) / df["alma_atr"], 
+    # Дивергенции и slope_div
+    df["slope_div"] = df["price_slope"] * df["cvd_slope"] * 10000.0
+    df["bull_div"] = ((df["price_slope"] < 0) & (df["cvd_slope"] > 0)).astype(float)
+    df["bear_div"] = ((df["price_slope"] > 0) & (df["cvd_slope"] < 0)).astype(float)
+    df["weighted_div"] = np.where(
+        (df["bull_div"] == 1) | (df["bear_div"] == 1),
+        df["price_slope"].abs() * df["cvd_slope"].abs(),
         0.0
     )
-    
-    # 3. Относительный объем (Текущий объем делим на средний исторический объем)
-    df["relative_volume"] = np.where(
-        df["alma_vol"] != 0,
-        df["Volume"] / df["alma_vol"],
-        1.0
-    )
 
-    df["alma_atr"] = df["alma_atr"].bfill().fillna(0.0001)
-    
-    # Drop initial NaNs from indicators
+    # RSI и отклонение от средней
+    df["rsi_norm"] = ta.rsi(df["Close"], length=14) / 100.0
+    df["price_dist_from_avg"] = np.where(df["alma_atr"] != 0, (df["Close"] - df["price_avg"]) / df["alma_atr"], 0.0)
+
+    # Признаки для 10-минутных данных
+    df["return_10"] = df["Close"].pct_change(10)
+    df["norm_return_10"] = df["return_10"] / (df["alma_atr"] / df["Close"] + 1e-8)
+
+    macd = ta.macd(df["Close"], fast=12, slow=26, signal=9)
+    df["macd_hist"] = macd["MACDh_12_26_9"] / (df["alma_atr"] / df["Close"] + 1e-8)
+
+    adx_df = ta.adx(df["High"], df["Low"], df["Close"], length=14)
+    df["adx"] = adx_df["ADX_14"] / 100.0
+
+    rolling_mean_vol = df["Volume"].rolling(100).mean()
+    rolling_std_vol = df["Volume"].rolling(100).std()
+    df["volume_zscore"] = (df["Volume"] - rolling_mean_vol) / (rolling_std_vol + 1e-8)
+    df["volume_zscore"] = df["volume_zscore"].clip(-3, 3)
+
+    df["volatility_regime"] = df["alma_atr"] / (df["alma_atr"].rolling(100).mean() + 1e-8)
+    df["div_persistence"] = df["weighted_div"].rolling(5).mean()
+
     df.dropna(inplace=True)
 
-    # Columns the AGENT should see 
     feature_cols = [
-        "alma_atr",
-        "relative_volume",
-        "price_dist_from_avg",
-        "rsi_norm",
-        "slope_div",
-        "cvd_slope",
-        "price_slope",
-        "bull_div",
-        "bear_div",
+        "norm_return_10", "macd_hist", "adx", "rsi_norm",
+        "price_dist_from_avg", "div_persistence", "volume_zscore",
+        "volatility_regime", "cvd_slope"
     ]
-
     return df, feature_cols
