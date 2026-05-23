@@ -100,7 +100,7 @@ def main():
                            random_start=False, episode_max_steps=None)
         
         train_vec_env = SubprocVecEnv([lambda i=i: make_train_env() for i in range(config['training']['num_envs'])])
-        train_vec_env = VecNormalize(train_vec_env, norm_obs=True, norm_reward=True, clip_obs=10.0, gamma=0.99)
+        train_vec_env = VecNormalize(train_vec_env, norm_obs=True, norm_reward=False, clip_obs=10.0, gamma=0.99)
         
         val_env = DummyVecEnv([lambda: make_eval_env(val_df, train_mean, train_std)])
         val_env = VecNormalize(val_env, norm_obs=True, norm_reward=False, training=False)
@@ -182,7 +182,7 @@ def main():
                        random_start=True, episode_max_steps=config['training']['episode_max_steps'])
     
     final_train_vec_env = SubprocVecEnv([lambda i=i: make_final_train_env() for i in range(config['training']['num_envs'])])
-    final_train_vec_env = VecNormalize(final_train_vec_env, norm_obs=True, norm_reward=True, clip_obs=10.0, gamma=0.99)
+    final_train_vec_env = VecNormalize(final_train_vec_env, norm_obs=True, norm_reward=False, clip_obs=10.0, gamma=0.99)
     
     final_model = RecurrentPPO(
         policy="MlpLstmPolicy", env=final_train_vec_env, verbose=1,
