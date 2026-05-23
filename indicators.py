@@ -3,15 +3,10 @@ import numpy as np
 import pandas_ta as ta
 
 def load_and_preprocess_data(csv_path: str):
-    """
-    Загрузка данных для акций Сбербанка (10-минутные бары).
-    Ожидаемые колонки: begin, open, high, low, close, volume.
-    Возвращает df с полными признаками и список колонок признаков.
-    """
     df = pd.read_csv(csv_path, parse_dates=["begin"], dayfirst=True)
     df.columns = df.columns.str.strip()
     df = df.set_index("begin").sort_index()
-    df.index = pd.to_datetime(df.index)   # гарантия datetime
+    df.index = pd.to_datetime(df.index)
     df = df.rename(columns={
         'open': 'Open', 'high': 'High', 'low': 'Low', 'close': 'Close', 'volume': 'Volume'
     })
@@ -24,17 +19,18 @@ def load_and_preprocess_data(csv_path: str):
     df["norm_pressure"] = np.where(df["bar_range"] != 0, df["pressure"] / df["bar_range"], 0.0)
     df["delta"] = df["norm_pressure"] * df["Volume"]
 
-    # ALMA сглаживание
+    # ALMA сглаживание (без look-ahead, использует только прошлые данные)
     df["cvd_avg"] = ta.alma(df["delta"], length=50, sigma=0.85, distribution_offset=4)
     df["price_avg"] = ta.alma(df["Close"], length=34, sigma=0.85, distribution_offset=4)
 
-    # Наклоны (без look-ahead)
-    cvd_linreg_curr = ta.linreg(df["cvd_avg"], length=8, offset=1).squeeze()
-    cvd_linreg_prev = ta.linreg(df["cvd_avg"], length=8, offset=2).squeeze()
+    # FIX: Наклоны без look-ahead – регрессия только по прошлым барам (исключая текущий)
+    # Используем shift(1) и shift(2), чтобы в момент t регрессия смотрела на бары t-8..t-1
+    cvd_linreg_curr = ta.linreg(df["cvd_avg"].shift(1), length=8)   # регрессия на t-7...t-1
+    cvd_linreg_prev = ta.linreg(df["cvd_avg"].shift(2), length=8)   # регрессия на t-8...t-2
     df["cvd_slope_raw"] = cvd_linreg_curr - cvd_linreg_prev
 
-    price_linreg_curr = ta.linreg(df["price_avg"], length=8, offset=1).squeeze()
-    price_linreg_prev = ta.linreg(df["price_avg"], length=8, offset=2).squeeze()
+    price_linreg_curr = ta.linreg(df["price_avg"].shift(1), length=8)
+    price_linreg_prev = ta.linreg(df["price_avg"].shift(2), length=8)
     df["price_slope_raw"] = price_linreg_curr - price_linreg_prev
 
     # ATR через ALMA
@@ -78,7 +74,6 @@ def load_and_preprocess_data(csv_path: str):
     df["volatility_regime"] = df["alma_atr"] / (df["alma_atr"].rolling(100).mean() + 1e-8)
     df["div_persistence"] = df["weighted_div"].rolling(5).mean()
 
-    # Удаляем строки с NaN (первые ~350 строк)
     df.dropna(inplace=True)
 
     feature_cols = [
