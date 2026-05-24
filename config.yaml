@@ -1,66 +1,56 @@
-# config.yaml
 data:
   path: "data/SBER_2018_2025.csv"
-  test_path: "data/SBER_test_2023_daily.csv"
   window_size: 60
   pip_value: 0.01
 
 environment:
-  spread_pips: 0.0
-  max_slippage_pips: 0.0
-  risk_per_trade: 0.01
+  spread_pips: 1.0
+  max_slippage_pips: 1.0
+  risk_per_trade: 0.003
   leverage: 1.0
-  commission_percent: 0.0006      # 0.05%
-  
-  # Динамический стоп-лосс на основе ATR
+  commission_percent: 0.0005
   use_atr_sl: true
-  atr_multiplier_sl: 2.0          # k для стопа
-  atr_multiplier_tp: [3.0, 5.0, 7.0, 9.0, 12.0]  # для разных множителей лота
-  
-  # Частичное закрытие
-  partial_close_enabled: false
-  partial_close_ratio: 0.5        # закрывать 50% позиции при первом TP
-  tp_levels: [0.5, 1.0]           # доли от основного TP для частичного закрытия
-  
-  reward:
-    reward_scale: 1.0
-    slope_div_reward_scale: 0.0
-    open_penalty_pips: 0.0
-    time_penalty_pips: 0.0
-  
-  # Фиксированные параметры (если atr_sl выключен)
+  atr_multiplier_sl: 2.0
+  atr_multiplier_tp: [3.0, 5.0, 7.0, 9.0, 12.0]
+  partial_close_enabled: true
+  partial_close_ratio: 0.5
+  tp_levels: [0.5, 1.0]
   fixed_sl_percent: 0.02
   fixed_tp_percents: [0.02, 0.04, 0.06, 0.08, 0.10]
 
+  reward:
+    open_penalty_pips: 0.1
+    time_penalty_pips: 0.01
+    slope_div_reward_scale: 0.01
+    reward_scale: 0.02
+
+risk:
+  max_drawdown: 0.3
+  use_kelly: true
+
 training:
-  total_timesteps: 2_000_000
-  num_envs: 8
-  episode_max_steps: 800
+  num_envs: 4
+  num_envs_manager: 2
   min_episode_steps: 300
-  
-  # Purged Walk-Forward
-  purge_days: 5                    # дни отступа между train и val
-  val_years: [2019, 2020, 2021, 2022]  # годы для валидации
-  
-  # PPO hyperparameters
-  learning_rate: 1e-4
+  episode_length: 1000
+  manager_episode_length: 100
+  manager_timesteps: 20000
+  episode_max_steps: null
+  total_timesteps: 2000000
+  ent_coef: 0.01
+  learning_rate: 0.0003
   n_steps: 2048
-  batch_size: 256
-  n_epochs: 4
+  batch_size: 64
+  n_epochs: 10
   gamma: 0.99
   gae_lambda: 0.95
   clip_range: 0.2
-  ent_coef: 0.02
-  vf_coef: 0.3
-  max_grad_norm: 0.7
-  
-  policy:
-    net_arch_shared: [128]
-    net_arch_pi: [64]
-    net_arch_vf: [32]
-    lstm_hidden_size: 48
-    n_lstm_layers: 1
+  vf_coef: 0.5
+  max_grad_norm: 0.5
 
-testing:
-  deterministic: true
-  save_trades: true
+  policy:
+    net_arch_shared: [256, 256]
+    net_arch_pi: [128]
+    net_arch_vf: [128]
+    lstm_hidden_size: 128
+    n_lstm_layers: 1
