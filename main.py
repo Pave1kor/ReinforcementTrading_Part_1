@@ -32,11 +32,10 @@ def walk_forward_semiannual(
     train_window_years=3,
     step_months=6
 ):
-    """
-    Честный walk-forward с окнами по полугодиям.
-    Для каждого тестового полугодия индикаторы рассчитываются заново
-    без подглядывания в будущее.
-    """
+    # Честный walk-forward с окнами по полугодиям.
+    # Для каждого тестового полугодия индикаторы рассчитываются заново
+    # без подглядывания в будущее.
+
     # Загружаем сырые данные один раз
     raw_df = pd.read_csv(csv_path, parse_dates=["begin"], dayfirst=True)
     raw_df.columns = raw_df.columns.str.strip().str.lower()

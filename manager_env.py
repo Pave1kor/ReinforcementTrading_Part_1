@@ -6,10 +6,10 @@ import pandas as pd
 from typing import Dict, Any
 
 class ManagerEnv(gym.Env):
-    """
-    Manager действует каждые 10 баров, предсказывает risk и direction.
-    Хронологический проход без случайных reset.
-    """
+
+    # Manager действует каждые 10 баров, предсказывает risk и direction.
+    # Хронологический проход без случайных reset.
+
     def __init__(self, df: pd.DataFrame, config: Dict[str, Any]):
         super().__init__()
         self.df = df.reset_index(drop=True)

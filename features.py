@@ -14,7 +14,7 @@ warnings.filterwarnings("ignore")
 # 1. ИНДИКАТОРЫ (основная функция, работает с сырым DataFrame)
 # ----------------------------------------------------------------------
 def load_and_preprocess_data(csv_path: str, return_features_only: bool = False) -> Tuple[pd.DataFrame, List[str]]:
-    """Загрузка из CSV и полный расчёт индикаторов (используется только для быстрого старта)."""
+    # Загрузка из CSV и полный расчёт индикаторов (используется только для быстрого старта)."""
     df = pd.read_csv(csv_path, parse_dates=["begin"], dayfirst=True)
     df.columns = df.columns.str.strip().str.lower()
     required = {"begin", "open", "high", "low", "close", "volume"}
@@ -33,11 +33,11 @@ def load_and_preprocess_data(csv_path: str, return_features_only: bool = False) 
     return _compute_indicators(df, return_features_only)
 
 def load_and_preprocess_data_from_raw(df: pd.DataFrame, return_features_only: bool = False) -> Tuple[pd.DataFrame, List[str]]:
-    """Расчёт индикаторов из уже загруженного DataFrame (с колонками Open, High, Low, Close, Volume)."""
+    # Расчёт индикаторов из уже загруженного DataFrame (с колонками Open, High, Low, Close, Volume)."""
     return _compute_indicators(df.copy(), return_features_only)
 
 def _compute_indicators(df: pd.DataFrame, return_features_only: bool = False) -> Tuple[pd.DataFrame, List[str]]:
-    """Общая логика расчёта индикаторов."""
+    # Общая логика расчёта индикаторов."""
     df["pressure"] = (df["Close"] - df["Low"]) - (df["High"] - df["Close"])
     df["bar_range"] = df["High"] - df["Low"]
     df["norm_pressure"] = df["pressure"] / (df["bar_range"] + 1e-8)
@@ -248,15 +248,6 @@ def evaluate_individuals_vectorized(individual, df_slice):
     pnl = np.sign(signal) * returns
     return compute_sharpe(pnl),
 
-def walk_forward_split(df, train_size=0.6, val_size=0.2, embargo=50):
-    n = len(df)
-    train_end = int(n * train_size)
-    val_end = int(n * (train_size + val_size))
-    train = df.iloc[:train_end]
-    val = df.iloc[train_end + embargo:val_end]
-    test = df.iloc[val_end + embargo:]
-    return train, val, test
-
 def tournament_select(population, k=1, tournsize=3):
     selected = []
     for _ in range(k):
@@ -272,17 +263,12 @@ def init_population(pop_size):
         pop.append(ind)
     return pop
 
-def train_genetic_vectorized(df, generations=20, pop_size=100):
-    """Старая функция с пропорциональным сплитом (не рекомендуется)."""
-    train_df, val_df, _ = walk_forward_split(df)
-    return _train_genetic(train_df, val_df, generations, pop_size)
-
 def train_genetic_on_split(train_df, val_df, generations=20, pop_size=100):
-    """Обучение GP с явным хронологическим разделением train/val."""
+    # Обучение GP с явным хронологическим разделением train/val."""
     return _train_genetic(train_df, val_df, generations, pop_size)
 
 def _train_genetic(train_df, val_df, generations, pop_size):
-    """Внутренняя функция обучения GP."""
+    # Внутренняя функция обучения GP."""
     population = init_population(pop_size)
 
     for gen in range(generations):
@@ -327,7 +313,7 @@ def load_genetic_trees(t0, t1, t2, t3):
     return tree0, tree1, tree2, tree3
 
 def add_genetic_features_vectorized(df, tree0, tree1, tree2, tree3):
-    """Векторизованное добавление генетических признаков (без .apply)."""
+    # Векторизованное добавление генетических признаков (без .apply)."""
     f0 = compile_vector(tree0, pset0)
     f1 = compile_vector(tree1, pset1)
     f2 = compile_vector(tree2, pset2)

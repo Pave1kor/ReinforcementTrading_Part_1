@@ -5,18 +5,18 @@ import aiomoex
 from datetime import datetime
 
 async def fetch_moex_candles(ticker, start_date, end_date, interval=24):
-    """
-    Асинхронное получение свечей с MOEX ISS.
     
-    Параметры:
-        ticker (str): Тикер инструмента, например, 'SBER', 'GAZP', 'IMOEX'.
-        start_date (str, datetime): Начальная дата в формате 'YYYY-MM-DD'.
-        end_date (str, datetime): Конечная дата в формате 'YYYY-MM-DD'.
-        interval (int): Минутный интервал свечи (1, 10, 60, 24(день)).
+    # Асинхронное получение свечей с MOEX ISS.
     
-    Возвращает:
-        pandas.DataFrame: Датафрейм с колонками 'open', 'close', 'high', 'low', 'volume'.
-    """
+    # Параметры:
+        # ticker (str): Тикер инструмента, например, 'SBER', 'GAZP', 'IMOEX'.
+        # start_date (str, datetime): Начальная дата в формате 'YYYY-MM-DD'.
+        # end_date (str, datetime): Конечная дата в формате 'YYYY-MM-DD'.
+        # interval (int): Минутный интервал свечи (1, 10, 60, 24(день)).
+    
+    # Возвращает:
+        # pandas.DataFrame: Датафрейм с колонками 'open', 'close', 'high', 'low', 'volume'.
+    
     if isinstance(start_date, datetime):
         start_date = start_date.strftime('%Y-%m-%d')
     if isinstance(end_date, datetime):

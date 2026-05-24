@@ -9,7 +9,7 @@ from environment import ForexTradingEnv
 from manager_env import ManagerEnv
 
 def train_manager_sequential(env_class, df, config, total_timesteps=20000):
-    """Обучение Manager на хронологических сегментах."""
+    # Обучение Manager на хронологических сегментах."""
     episode_length = config['training'].get('manager_episode_length', 100)
     lookback = 10
     segment_len = episode_length * lookback
@@ -55,7 +55,7 @@ def train_manager_sequential(env_class, df, config, total_timesteps=20000):
 
 
 def train_worker_sequential(env_class, df, config, manager_model, genetic_cols, total_timesteps):
-    """Обучение Worker на хронологических сегментах."""
+    # Обучение Worker на хронологических сегментах."""
     episode_length = config['training'].get('episode_length', 1000)
     num_segments = len(df) // episode_length
 
@@ -106,10 +106,10 @@ def train_worker_sequential(env_class, df, config, manager_model, genetic_cols, 
 
 
 def evaluate_full_period(model, env, df_test, vec_normalize=None):
-    """
-    Оценка на полном тестовом периоде с start_idx=0.
-    Возвращает массив эквити.
-    """
+
+    # Оценка на полном тестовом периоде с start_idx=0.
+    # Возвращает массив эквити.
+
     env.reset(start_idx=0)
     vec_env = DummyVecEnv([lambda: env])
     if vec_normalize is not None:

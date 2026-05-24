@@ -6,10 +6,10 @@ import pandas as pd
 from typing import List, Dict, Any, Optional
 
 class ForexTradingEnv(gym.Env):
-    """
-    Торговая среда для акций (SBER) с иерархическим Manager.
-    Все расчёты ведутся в долях начального капитала (equity).
-    """
+
+    # Торговая среда для акций (SBER) с иерархическим Manager.
+    # Все расчёты ведутся в долях начального капитала (equity).
+    
     def __init__(self, df: pd.DataFrame, config: Dict[str, Any],
                  manager_model: Optional[Any] = None,
                  genetic_feature_cols: Optional[List[str]] = None):
