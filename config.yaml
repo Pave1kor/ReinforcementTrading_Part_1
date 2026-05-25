@@ -19,10 +19,10 @@ environment:
   fixed_tp_percents: [0.02, 0.04, 0.06, 0.08, 0.10]
 
   reward:
-    open_penalty_pips: 0.1
-    time_penalty_pips: 0.01
+    open_penalty_pips: 0.0
+    time_penalty_pips: 0.0
     slope_div_reward_scale: 0.01
-    reward_scale: 0.02
+    reward_scale: 1.0
 
 risk:
   max_drawdown: 0.3
@@ -36,9 +36,9 @@ training:
   manager_episode_length: 100
   manager_timesteps: 20000
   episode_max_steps: null
-  total_timesteps: 2000000
-  ent_coef: 0.01
-  learning_rate: 0.0003
+  total_timesteps: 5000000
+  ent_coef: 0.005
+  learning_rate: 0.0001
   n_steps: 2048
   batch_size: 64
   n_epochs: 10

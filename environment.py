@@ -14,7 +14,7 @@ class ForexTradingEnv(gym.Env):
                  manager_model: Optional[Any] = None,
                  genetic_feature_cols: Optional[List[str]] = None):
         super().__init__()
-        self.df = df.reset_index(drop=True)
+        self.df = df.copy()
         self.config = config
         self.manager = manager_model
         self.genetic_cols = genetic_feature_cols or []
@@ -37,10 +37,10 @@ class ForexTradingEnv(gym.Env):
         self.partial_close_ratio = env_cfg.get('partial_close_ratio', 0.5)
         self.tp_levels = env_cfg.get('tp_levels', [0.5, 1.0])
 
-        # === Reward shaping ===
+        # === Reward shaping (временно отключены штрафы) ===
         rew_cfg = env_cfg.get('reward', {})
-        self.open_penalty_pips = rew_cfg.get('open_penalty_pips', 0.0)
-        self.time_penalty_pips = rew_cfg.get('time_penalty_pips', 0.0)
+        self.open_penalty_pips = 0.0    # rew_cfg.get('open_penalty_pips', 0.0) – отключено
+        self.time_penalty_pips = 0.0    # rew_cfg.get('time_penalty_pips', 0.0) – отключено
         self.slope_div_scale = rew_cfg.get('slope_div_reward_scale', 0.0)
         self.reward_scale = rew_cfg.get('reward_scale', 1.0)
 
@@ -48,13 +48,16 @@ class ForexTradingEnv(gym.Env):
         risk_cfg = config.get('risk', {})
         self.max_drawdown = risk_cfg.get('max_drawdown', 1.0)  # 0.3 = 30%
 
+        # === Порог для входа (доля от максимального сигнала) ===
+        self.entry_threshold = 0.3  # если |raw_signal| >= 0.3, входим
+
         # === Пространства ===
-        obs_features = 7 + len(self.genetic_cols) + 5  # market + genetic + [pos, upnl, time_in, manager_risk, manager_dir]
+        obs_features = 7 + len(self.genetic_cols) + 5
         self.observation_space = spaces.Box(-np.inf, np.inf, (obs_features,), dtype=np.float32)
         self.action_space = spaces.Box(-1, 1, (1,), dtype=np.float32)
 
         # === Внутреннее состояние ===
-        self.position = 0.0          # доля капитала (положительная = лонг, отрицательная = шорт)
+        self.position = 0.0
         self.entry_price = 0.0
         self.equity = 1.0
         self.peak_equity = 1.0
@@ -65,8 +68,6 @@ class ForexTradingEnv(gym.Env):
         self._manager_risk = 0.0
         self._manager_dir = 0.0
         self.steps_since_manager = 10
-
-        # Для хронологического теста
         self._start_idx = 0
 
     def reset(self, start_idx=None, seed=None, options=None):
@@ -102,80 +103,70 @@ class ForexTradingEnv(gym.Env):
         next_row = self.df.iloc[next_idx]
         next_price = next_row['Close']
 
-        # Моделируем проскальзывание (наихудший случай против нас)
+        # Моделируем проскальзывание
         slippage = np.random.uniform(0, self.max_slippage_pips * self.pip_value / price)
         if action[0] > 0:   # покупка
             exec_price = next_price * (1 + slippage)
         else:
             exec_price = next_price * (1 - slippage)
 
-        # 3. Расчёт текущих штрафов в долях капитала
-        open_penalty = self.open_penalty_pips * self.pip_value / price
-        time_penalty = self.time_penalty_pips * self.pip_value / price
-
         reward = 0.0
         done = False
         info = {}
 
-        # 4. Обработка открытой позиции (стопы / тейки / частичное закрытие)
+        # 4. Обработка открытой позиции
         if self.position != 0.0 and self.entry_price > 0:
-            # Плавающий PnL в долях капитала
-            if self.position > 0:
-                upnl = self.position * (exec_price / self.entry_price - 1)
-            else:
-                upnl = self.position * (exec_price / self.entry_price - 1)   # для шорта формула та же
-
-            # Расчёт стоп-лосса и тейк-профитов
             sl_price = self._calc_sl()
             tp_prices = self._calc_tp()
 
             sl_hit = False
-            tp_hit_idx = -1
+            tp_hit_indices = []
             if self.position > 0:
                 if exec_price <= sl_price:
                     sl_hit = True
                 for i, tp in enumerate(tp_prices):
                     if exec_price >= tp:
-                        tp_hit_idx = i
-                        break
+                        tp_hit_indices.append(i)
             else:
                 if exec_price >= sl_price:
                     sl_hit = True
                 for i, tp in enumerate(tp_prices):
                     if exec_price <= tp:
-                        tp_hit_idx = i
-                        break
+                        tp_hit_indices.append(i)
 
             if sl_hit:
                 # Закрытие всей позиции по стопу
                 close_pnl = self.position * (exec_price / self.entry_price - 1)
-                cost = self._close_costs()
-                reward = close_pnl - cost
-                self.equity *= (1 + reward)
+                cost = self._close_costs(exec_price, abs(self.position))
+                trade_reward = close_pnl - cost
+                self.equity *= (1 + trade_reward)
+                reward = trade_reward
                 self.position = 0.0
                 self.entry_price = 0.0
                 self.steps_in_trade = 0
-            elif tp_hit_idx >= 0:
-                # Частичное или полное закрытие по тейку
-                if self.partial_close_enabled and tp_hit_idx < len(self.tp_levels):
-                    close_frac = self.tp_levels[tp_hit_idx] * self.partial_close_ratio
-                else:
-                    close_frac = 1.0   # полный выход
-                close_size = self.position * close_frac
-                partial_pnl = close_size * (exec_price / self.entry_price - 1)
-                cost = self._close_costs(close_size)
-                reward = partial_pnl - cost
-                self.equity *= (1 + reward)
-                self.position -= close_size
-                if abs(self.position) < 1e-6:
+            elif tp_hit_indices:
+                # Частичные закрытия по уровням тейк-профита
+                for idx in tp_hit_indices:
+                    if abs(self.position) < 1e-9:
+                        break
+                    if self.partial_close_enabled and idx < len(self.tp_levels):
+                        close_frac = self.tp_levels[idx] * self.partial_close_ratio
+                    else:
+                        close_frac = 1.0   # если не включено частичное закрытие, закрываем целиком
+                    close_size = self.position * close_frac
+                    partial_pnl = close_size * (exec_price / self.entry_price - 1)
+                    cost = self._close_costs(exec_price, abs(close_size))
+                    trade_reward = partial_pnl - cost
+                    self.equity *= (1 + trade_reward)
+                    reward += trade_reward
+                    self.position -= close_size
+                if abs(self.position) < 1e-9:
                     self.position = 0.0
                     self.entry_price = 0.0
                     self.steps_in_trade = 0
             else:
-                # Удержание позиции
-                reward -= time_penalty
+                # Удержание позиции – reward не меняется
                 self.steps_in_trade += 1
-                # Бонус за сильную дивергенцию в направлении позиции
                 if self.slope_div_scale != 0:
                     reward += self.slope_div_scale * row['slope_div'] * np.sign(self.position)
 
@@ -183,27 +174,30 @@ class ForexTradingEnv(gym.Env):
             if self.equity > self.peak_equity:
                 self.peak_equity = self.equity
 
-        # 5. Действие агента: определение желаемой позиции с учётом риска
+        # 5. Действие агента: определение желаемой позиции (фиксированный размер)
         raw_action = action[0]
-        # Масштабируем на риск и manager
-        desired_pos = raw_action * self._manager_dir * self._manager_risk
-        # Ограничиваем максимальный размер позиции долей капитала risk_per_trade
-        target_pos = np.clip(desired_pos * self.risk_per_trade, -self.risk_per_trade, self.risk_per_trade)
+        raw_signal = raw_action * self._manager_dir * self._manager_risk
+        # Фиксированный размер позиции с порогом
+        if abs(raw_signal) >= self.entry_threshold:
+            target_pos = np.sign(raw_signal) * self.risk_per_trade
+        else:
+            target_pos = 0.0
 
         # 6. Вход в позицию
-        if self.position == 0.0 and abs(target_pos) > 1e-6:
+        if self.position == 0.0 and target_pos != 0.0:
             self.position = target_pos
             self.entry_price = exec_price
             entry_cost = self._entry_costs()
-            reward -= entry_cost + open_penalty
-            self.equity *= (1 - entry_cost)   # немедленный учёт издержек
+            self.equity *= (1 - entry_cost)
+            reward -= entry_cost
             self.steps_in_trade = 0
         # 7. Выход из позиции
-        elif self.position != 0.0 and abs(target_pos) < 1e-6:
+        elif self.position != 0.0 and target_pos == 0.0:
             close_pnl = self.position * (exec_price / self.entry_price - 1)
-            cost = self._close_costs()
-            reward += close_pnl - cost
-            self.equity *= (1 + close_pnl - cost)
+            cost = self._close_costs(exec_price, abs(self.position))
+            trade_reward = close_pnl - cost
+            self.equity *= (1 + trade_reward)
+            reward += trade_reward
             self.position = 0.0
             self.entry_price = 0.0
             self.steps_in_trade = 0
@@ -211,12 +205,12 @@ class ForexTradingEnv(gym.Env):
         # 8. Проверка максимальной просадки
         if self.equity < self.peak_equity * (1 - self.max_drawdown):
             done = True
-            reward -= 1.0  # штраф за нарушение риск-менеджмента
+            reward -= 1.0
 
         # 9. Глобальное масштабирование reward
         reward *= self.reward_scale
 
-        # 10. Шаг времени и завершение эпизода
+        # 10. Шаг времени
         self.idx += 1
         self.steps_since_manager += 1
         if self.idx >= len(self.df) - 1:
@@ -249,16 +243,13 @@ class ForexTradingEnv(gym.Env):
         return tps
 
     def _entry_costs(self):
-        # Спред + комиссия (только одна сторона) в долях капитала
         spread_cost = (self.spread_pips * self.pip_value) / self.entry_price * abs(self.position)
         comm = self.commission_pct * abs(self.position)
         return spread_cost + comm
 
-    def _close_costs(self, size=None):
-        if size is None:
-            size = abs(self.position)
-        price = self.df.iloc[self.idx]['Close']
-        spread_cost = (self.spread_pips * self.pip_value) / price * size
+    def _close_costs(self, exec_price, size):
+        """Издержки при закрытии: спред и комиссия от объёма size"""
+        spread_cost = (self.spread_pips * self.pip_value) / exec_price * size
         comm = self.commission_pct * size
         return spread_cost + comm
 
